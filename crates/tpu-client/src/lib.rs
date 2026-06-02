@@ -5,7 +5,7 @@
 //! a subsystem of [Cascade-Marketplace](https://triton.one/cascade),
 //!
 //! This crate exposes a Yellowstone gRPC TPU sender for routing transactions to the current
-//! Solana leader over QUIC.
+//! Solana leader and upcoming unique leaders over QUIC.
 //!
 //! The internal async event-loop engine uses [quinn] and [tokio] crates to provide a high-performance QUIC-based transport protocol implementation.
 //! It is designed to handle the latest Agave network changes and covers all the edge-cases observed in production usage:
@@ -23,10 +23,10 @@
 //! This crate come with a _smart_ TPU sender implementation: [YellowstoneTpuSender](`crate::yellowstone_grpc::sender::YellowstoneTpuSender`)
 //!
 //! This sender implementation exposes one core sending strategy:
-//! send each transaction to the current leader and, near a slot boundary,
-//! the next leader in the schedule.
+//! send each transaction to each unique leader in the configured slot fanout window.
 //!
-//! The sender automatically tracks the current slot and leader schedule.
+//! The sender automatically tracks the current slot and leader schedule, predicts upcoming
+//! leaders for connection warmup, and keeps per-leader transaction queues bounded.
 //!
 //! ## Example
 //!

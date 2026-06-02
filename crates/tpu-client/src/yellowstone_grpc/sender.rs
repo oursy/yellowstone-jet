@@ -328,7 +328,7 @@ impl YellowstoneTpuSender {
         }
     }
 
-    /// Enqueues a transaction to the TPU of the current leader without allocating an async future.
+    /// Enqueues a transaction to the current and upcoming unique leaders without allocating an async future.
     pub fn try_send_txn<T>(&self, sig: Signature, txn: T) -> Result<(), SendError>
     where
         T: AsRef<[u8]> + Send + 'static,
@@ -337,7 +337,7 @@ impl YellowstoneTpuSender {
     }
 
     ///
-    /// Sends a transaction to the TPU of the current leader.
+    /// Sends a transaction to the current and upcoming unique leaders.
     ///
     /// # Arguments
     ///

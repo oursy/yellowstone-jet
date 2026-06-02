@@ -20,6 +20,9 @@ It implements the state-of-the-art approach to send transaction, that includes:
 
 - No transaction fragmentation
 - By pass most `quinn` lock-contention issues using a dedicated event-loop and endpoint per remote peer.
+- Configurable leader fanout to the current and upcoming unique leaders.
+- Connection prediction so upcoming leaders can be warmed before the next send.
+- Bounded per-leader queues to avoid unbounded memory growth under TPU backpressure.
 
 ## Usage
 
@@ -182,7 +185,7 @@ async fn main() {
     tracing::info!("generate transaction {signature} with send lamports {LAMPORTS}");
     let bincoded_txn = bincode::serialize(&transaction).expect("bincode::serialize");
 
-    // Send the transaction to the current leader
+    // Send the transaction to the current and upcoming unique leaders
     sender
         .send_txn(signature, bincoded_txn)
         .await
