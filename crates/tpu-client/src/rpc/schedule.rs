@@ -74,7 +74,17 @@ where
     ret.resize(ret.capacity(), Pubkey::default());
 
     for (pubkey_str, sorted_slot_idx) in resp {
-        let pubkey = Pubkey::from_str(pubkey_str.as_str()).expect("Pubkey::from_str");
+        let pubkey = match Pubkey::from_str(pubkey_str.as_str()) {
+            Ok(pubkey) => pubkey,
+            Err(err) => {
+                tracing::warn!(
+                    "Skipping leader schedule entry with invalid pubkey {:?}: {:?}",
+                    pubkey_str,
+                    err
+                );
+                continue;
+            }
+        };
         sorted_slot_idx
             .iter()
             .filter(|s| *s % 4 == 0)
@@ -156,6 +166,36 @@ pub struct ManagedLeaderSchedule {
 pub struct PoisonError;
 
 impl ManagedLeaderSchedule {
+    #[cfg(test)]
+    pub(crate) fn new_for_tests(first_slot: u64, schedule: Vec<Pubkey>) -> Self {
+        let current = CompactSortedSchedule {
+            first_slot,
+            schedule: schedule.clone(),
+        };
+        let next = CompactSortedSchedule {
+            first_slot: first_slot + DEFAULT_SLOTS_PER_EPOCH,
+            schedule,
+        };
+        Self {
+            inner: Arc::new(RwLock::new(InnerManagedLeaderSchedule {
+                double_buffer: [current, next],
+                fail: AtomicBool::new(false),
+            })),
+        }
+    }
+
+    fn get_leader_from_schedules(
+        schedules: &InnerManagedLeaderSchedule,
+        slot: u64,
+    ) -> Option<Pubkey> {
+        let schedule = if slot >= schedules.double_buffer[1].first_slot {
+            &schedules.double_buffer[1]
+        } else {
+            &schedules.double_buffer[0]
+        };
+        schedule.get(&slot).cloned()
+    }
+
     ///
     /// Get the leader for a given slot.
     ///
@@ -170,19 +210,43 @@ impl ManagedLeaderSchedule {
     /// Returns `PoisonError` if the background update task has failed.
     ///
     pub fn get_leader(&self, slot: u64) -> Result<Option<Pubkey>, PoisonError> {
-        let schedules = self.inner.read().unwrap();
+        let Ok(schedules) = self.inner.read() else {
+            return Err(PoisonError);
+        };
         // Relaxed ordering is sufficient here since fail does not protect any data.
         // We already use RwLock to protect the double_buffer data.
         if schedules.fail.load(std::sync::atomic::Ordering::Relaxed) {
             return Err(PoisonError);
         }
-        let schedule = if slot >= schedules.double_buffer[1].first_slot {
-            &schedules.double_buffer[1]
-        } else {
-            &schedules.double_buffer[0]
-        };
-        Ok(schedule.get(&slot).cloned())
+        Ok(Self::get_leader_from_schedules(&schedules, slot))
     }
+
+    ///
+    /// Get leaders for multiple slots while taking the schedule read lock only once.
+    ///
+    /// This is useful on the transaction submission path where the current and next
+    /// leader boundary are checked together near a slot boundary.
+    ///
+    pub fn get_leaders_for_slots<const N: usize>(
+        &self,
+        slots: [u64; N],
+    ) -> Result<[Option<Pubkey>; N], PoisonError> {
+        let Ok(schedules) = self.inner.read() else {
+            return Err(PoisonError);
+        };
+        if schedules.fail.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(PoisonError);
+        }
+        Ok(slots.map(|slot| Self::get_leader_from_schedules(&schedules, slot)))
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum SpawnManagedLeaderScheduleError {
+    #[error(transparent)]
+    Client(#[from] client_error::ClientError),
+    #[error("leader schedule unavailable for slot context {0:?}")]
+    LeaderScheduleUnavailable(Option<u64>),
 }
 
 async fn auto_leader_schedule_loop(
@@ -191,26 +255,13 @@ async fn auto_leader_schedule_loop(
     rpc_client: Arc<RpcClient>,
     cancellation_token: tokio_util::sync::CancellationToken,
 ) {
-    pub struct OnDrop {
-        shared: Option<Arc<RwLock<InnerManagedLeaderSchedule>>>,
-    }
-
-    impl Drop for OnDrop {
-        fn drop(&mut self) {
-            if let Some(shared) = self.shared.take() {
-                let Ok(schedules) = shared.read() else {
-                    return;
-                };
-                // Since we are already synchronously dropping (RwLock), it's safe to use Relaxed ordering here.
-                // This trick have been taking from std::sync::poison implementation!
-                schedules
-                    .fail
-                    .store(true, std::sync::atomic::Ordering::Relaxed);
-            }
+    let initial = match shared.read() {
+        Ok(shared) => shared.double_buffer.clone(),
+        Err(err) => {
+            tracing::error!("AutoLeaderSchedule: lock poisoned on startup: {:?}", err);
+            return;
         }
-    }
-
-    let initial = shared.read().expect("read").double_buffer.clone();
+    };
 
     let mut current_epoch = initial[0].first_slot / DEFAULT_SLOTS_PER_EPOCH;
 
@@ -223,11 +274,16 @@ async fn auto_leader_schedule_loop(
             }
         }
 
-        let epoch = rpc_client
-            .get_epoch_info()
-            .await
-            .expect("rpc_client.get_epoch_info")
-            .epoch;
+        let epoch = match rpc_client.get_epoch_info().await {
+            Ok(epoch_info) => epoch_info.epoch,
+            Err(err) => {
+                tracing::error!(
+                    "AutoLeaderSchedule: failed to fetch epoch info; keeping previous schedule: {:?}",
+                    err
+                );
+                continue;
+            }
+        };
 
         if epoch == current_epoch {
             tracing::debug!("AutoLeaderSchedule: still in epoch {}", current_epoch);
@@ -235,14 +291,34 @@ async fn auto_leader_schedule_loop(
             // Only fetch the next schedule if we're still in the same epoch
             // Making sure we have the freshest schedule ready when we transition
             let next_epoch_first_slot = (current_epoch + 1) * DEFAULT_SLOTS_PER_EPOCH;
-            let next_schedule = rpc_client
+            let next_schedule = match rpc_client
                 .get_unnested_leader_schedule(Some(next_epoch_first_slot))
                 .await
-                .expect("rpc_client.get_unnested_leader_schedule next")
-                .expect("None next schedule");
             {
-                let mut schedules = shared.write().expect("write");
-                schedules.double_buffer[1] = next_schedule;
+                Ok(Some(next_schedule)) => next_schedule,
+                Ok(None) => {
+                    tracing::warn!(
+                        "AutoLeaderSchedule: next schedule unavailable for first slot {}",
+                        next_epoch_first_slot
+                    );
+                    continue;
+                }
+                Err(err) => {
+                    tracing::error!(
+                        "AutoLeaderSchedule: failed to fetch next schedule; keeping previous schedule: {:?}",
+                        err
+                    );
+                    continue;
+                }
+            };
+            match shared.write() {
+                Ok(mut schedules) => {
+                    schedules.double_buffer[1] = next_schedule;
+                }
+                Err(err) => {
+                    tracing::error!("AutoLeaderSchedule: lock poisoned: {:?}", err);
+                    return;
+                }
             }
 
             continue;
@@ -252,9 +328,8 @@ async fn auto_leader_schedule_loop(
                 current_epoch,
                 epoch
             );
-            current_epoch = epoch;
-            let first_slot_current_epoch = current_epoch * DEFAULT_SLOTS_PER_EPOCH;
-            let next_epoch_first_slot = (current_epoch + 1) * DEFAULT_SLOTS_PER_EPOCH;
+            let first_slot_current_epoch = epoch * DEFAULT_SLOTS_PER_EPOCH;
+            let next_epoch_first_slot = (epoch + 1) * DEFAULT_SLOTS_PER_EPOCH;
 
             let current_schedule_fut =
                 rpc_client.get_unnested_leader_schedule(Some(first_slot_current_epoch));
@@ -264,16 +339,50 @@ async fn auto_leader_schedule_loop(
 
             let (current_schedule, next_schedule) =
                 join(current_schedule_fut, next_schedule_fut).await;
-            let current_schedule = current_schedule
-                .expect("rpc_client.get_unnested_leader_schedule current")
-                .expect("None current schedule");
-            let next_schedule = next_schedule
-                .expect("rpc_client.get_unnested_leader_schedule next")
-                .expect("None next schedule");
+            let current_schedule = match current_schedule {
+                Ok(Some(current_schedule)) => current_schedule,
+                Ok(None) => {
+                    tracing::warn!(
+                        "AutoLeaderSchedule: current schedule unavailable for first slot {}",
+                        first_slot_current_epoch
+                    );
+                    continue;
+                }
+                Err(err) => {
+                    tracing::error!(
+                        "AutoLeaderSchedule: failed to fetch current schedule; keeping previous schedule: {:?}",
+                        err
+                    );
+                    continue;
+                }
+            };
+            let next_schedule = match next_schedule {
+                Ok(Some(next_schedule)) => next_schedule,
+                Ok(None) => {
+                    tracing::warn!(
+                        "AutoLeaderSchedule: next schedule unavailable for first slot {}",
+                        next_epoch_first_slot
+                    );
+                    continue;
+                }
+                Err(err) => {
+                    tracing::error!(
+                        "AutoLeaderSchedule: failed to fetch next schedule; keeping previous schedule: {:?}",
+                        err
+                    );
+                    continue;
+                }
+            };
 
-            {
-                let mut schedules = shared.write().expect("write");
-                schedules.double_buffer = [current_schedule, next_schedule];
+            match shared.write() {
+                Ok(mut schedules) => {
+                    schedules.double_buffer = [current_schedule, next_schedule];
+                    current_epoch = epoch;
+                }
+                Err(err) => {
+                    tracing::error!("AutoLeaderSchedule: lock poisoned: {:?}", err);
+                    return;
+                }
             }
         }
     }
@@ -316,11 +425,10 @@ impl Default for ManagedLeaderScheduleConfig {
 pub async fn spawn_managed_leader_schedule(
     rpc_client: Arc<RpcClient>,
     config: ManagedLeaderScheduleConfig,
-) -> Result<(ManagedLeaderSchedule, JoinHandle<()>), client_error::ClientError> {
-    let initial_schedule = rpc_client
-        .get_unnested_leader_schedule(None)
-        .await?
-        .expect("Failed to fetch initial leader schedule");
+) -> Result<(ManagedLeaderSchedule, JoinHandle<()>), SpawnManagedLeaderScheduleError> {
+    let initial_schedule = rpc_client.get_unnested_leader_schedule(None).await?.ok_or(
+        SpawnManagedLeaderScheduleError::LeaderScheduleUnavailable(None),
+    )?;
 
     let current_epoch = initial_schedule.first_slot / DEFAULT_SLOTS_PER_EPOCH;
     let next_epoch_first_slot = (current_epoch + 1) * DEFAULT_SLOTS_PER_EPOCH;
@@ -328,7 +436,9 @@ pub async fn spawn_managed_leader_schedule(
     let next_schedule = rpc_client
         .get_unnested_leader_schedule(Some(next_epoch_first_slot))
         .await?
-        .expect("Failed to fetch next leader schedule");
+        .ok_or(SpawnManagedLeaderScheduleError::LeaderScheduleUnavailable(
+            Some(next_epoch_first_slot),
+        ))?;
 
     let shared = Arc::new(RwLock::new(InnerManagedLeaderSchedule {
         double_buffer: [initial_schedule, next_schedule],
@@ -348,10 +458,14 @@ pub async fn spawn_managed_leader_schedule(
 #[cfg(test)]
 mod tests {
     use {
+        super::*,
         rand::distr::{Distribution, weighted::WeightedIndex},
         solana_clock::DEFAULT_SLOTS_PER_EPOCH,
         solana_pubkey::Pubkey,
-        std::collections::BTreeMap,
+        std::{
+            collections::BTreeMap,
+            sync::{Arc, RwLock, atomic::AtomicBool},
+        },
     };
 
     fn exponential_distribution(n: usize, base: f64, r: f64) -> Vec<u64> {
@@ -409,5 +523,33 @@ mod tests {
 
         assert!(diff.is_empty(), "Mismatched keys: {diff:?}");
         assert_eq!(nested_schedule, actual);
+    }
+
+    #[test]
+    fn get_leaders_for_slots_matches_individual_lookup() {
+        let leader_a = Pubkey::new_unique();
+        let leader_b = Pubkey::new_unique();
+        let current = CompactSortedSchedule {
+            first_slot: 0,
+            schedule: vec![leader_a, leader_b],
+        };
+        let next = CompactSortedSchedule {
+            first_slot: DEFAULT_SLOTS_PER_EPOCH,
+            schedule: vec![Pubkey::new_unique()],
+        };
+        let managed = ManagedLeaderSchedule {
+            inner: Arc::new(RwLock::new(InnerManagedLeaderSchedule {
+                double_buffer: [current, next],
+                fail: AtomicBool::new(false),
+            })),
+        };
+
+        let batched = managed
+            .get_leaders_for_slots([0, 4])
+            .expect("batched lookup");
+
+        assert_eq!(batched[0], managed.get_leader(0).expect("slot 0"));
+        assert_eq!(batched[1], managed.get_leader(4).expect("slot 4"));
+        assert_eq!(batched, [Some(leader_a), Some(leader_b)]);
     }
 }

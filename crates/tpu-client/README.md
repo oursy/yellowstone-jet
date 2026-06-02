@@ -10,7 +10,6 @@ When you enable `yellowstone-grpc` feature-flag, you will have access to a the _
 - Slot tracking
 - Leader tracking and upcoming schedules
 - Connection evictions
-- Blocklist
 - Certificates management
 - Retries
 - QUIC Stream handling
@@ -44,11 +43,8 @@ use {
     },
     tracing::level_filters::LevelFilter,
     tracing_subscriber::{EnvFilter, layer::SubscriberExt as _, util::SubscriberInitExt},
-    yellowstone_jet_tpu_client::{
-        core::TpuSenderResponse,
-        yellowstone_grpc::sender::{
-            Endpoints, NewYellowstoneTpuSender, create_yellowstone_tpu_sender,
-        },
+    yellowstone_jet_tpu_client::yellowstone_grpc::sender::{
+        Endpoints, NewYellowstoneTpuSender, create_yellowstone_tpu_sender,
     },
 };
 
@@ -162,7 +158,6 @@ async fn main() {
     let NewYellowstoneTpuSender {
         mut sender,
         related_objects_jh: _,
-        mut response,
     } = create_yellowstone_tpu_sender(Default::default(), identity.insecure_clone(), endpoints)
         .await
         .expect("tpu-sender");
@@ -193,20 +188,7 @@ async fn main() {
         .await
         .expect("send_transaction");
 
-    let TpuSenderResponse::TxSent(resp) = response.recv().await.expect("response") else {
-        panic!("unexpected response");
-    };
-
-    assert!(
-        resp.tx_sig == signature,
-        "unexpected tx signature in response"
-    );
-    writeln!(
-        &mut out,
-        "sent transaction with signature `{}` to validator `{}`",
-        resp.tx_sig, resp.remote_peer_identity
-    )
-    .expect("writeln");
+    writeln!(&mut out, "submitted transaction with signature `{signature}`").expect("writeln");
 }
 ```
 

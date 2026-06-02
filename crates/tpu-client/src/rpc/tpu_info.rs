@@ -17,7 +17,6 @@ use {
     std::{
         collections::HashMap,
         net::SocketAddr,
-        panic,
         str::FromStr,
         sync::{Arc, RwLock},
     },
@@ -73,7 +72,13 @@ impl RpcClusterTpuQuicInfoService {
     /// Get the current topology mapping of leader pubkeys to their TPU QUIC contact info.
     ///
     pub fn get_current_topology_mapping(&self) -> HashMap<Pubkey, RpcTpuQuicContactInfo> {
-        self.shared.read().expect("read lock").clone()
+        match self.shared.read() {
+            Ok(shared) => shared.clone(),
+            Err(err) => {
+                tracing::error!("TPU contact-info lock poisoned: {:?}", err);
+                HashMap::new()
+            }
+        }
     }
 }
 
@@ -138,7 +143,17 @@ fn detect_tpu_contact_info_diff(
     let mut ret = new
         .iter()
         .filter_map(|node| {
-            let pubkey = Pubkey::from_str(&node.pubkey).expect("Pubkey::from_str");
+            let pubkey = match Pubkey::from_str(&node.pubkey) {
+                Ok(pubkey) => pubkey,
+                Err(err) => {
+                    tracing::warn!(
+                        "Skipping TPU contact-info entry with invalid pubkey {:?}: {:?}",
+                        node.pubkey,
+                        err
+                    );
+                    return None;
+                }
+            };
             let contact_info = RpcTpuQuicContactInfo::from(node);
             to_remove.remove(&pubkey);
             match current.get(&pubkey) {
@@ -184,7 +199,6 @@ async fn cluster_info_refresh_loop(
     cancellation_token: CancellationToken,
 ) {
     let mut interval = tokio::time::interval(config.refresh_interval);
-    let last_snapshot = shared.read().expect("read").clone();
     let mut consecutive_fetch_errors = 0;
     loop {
         tokio::select! {
@@ -202,12 +216,24 @@ async fn cluster_info_refresh_loop(
             Ok(nodes) => {
                 // Update shared state
                 consecutive_fetch_errors = 0;
-                let diff = detect_tpu_contact_info_diff(&last_snapshot, &nodes);
+                let current_snapshot = match shared.read() {
+                    Ok(shared) => shared.clone(),
+                    Err(err) => {
+                        tracing::error!("TPU contact-info lock poisoned: {:?}", err);
+                        break;
+                    }
+                };
+                let diff = detect_tpu_contact_info_diff(&current_snapshot, &nodes);
 
                 if !diff.is_empty() {
                     tracing::trace!("Updating cluster nodes with {} changes.", diff.len());
-                    let mut writable = shared.write().expect("write");
-                    apply_diff_patch(&mut writable, diff);
+                    match shared.write() {
+                        Ok(mut writable) => apply_diff_patch(&mut writable, diff),
+                        Err(err) => {
+                            tracing::error!("TPU contact-info lock poisoned: {:?}", err);
+                            break;
+                        }
+                    }
                 } else {
                     tracing::trace!("No changes in cluster nodes detected.");
                 }
@@ -222,8 +248,11 @@ async fn cluster_info_refresh_loop(
                     );
                     continue;
                 } else {
-                    tracing::error!("Failed to fetch cluster nodes: {:?}", e);
-                    panic::panic_any(e)
+                    tracing::error!(
+                        "Failed to fetch cluster nodes; keeping previous TPU contact-info snapshot: {:?}",
+                        e
+                    );
+                    continue;
                 }
             }
         }
@@ -253,11 +282,19 @@ pub async fn rpc_cluster_tpu_info_service(
         .get_cluster_nodes()
         .await?
         .into_iter()
-        .map(|node| {
-            (
-                Pubkey::from_str(node.pubkey.as_str()).expect("Pubkey::from_str"),
-                RpcTpuQuicContactInfo::from(&node),
-            )
+        .filter_map(|node| {
+            let pubkey = match Pubkey::from_str(node.pubkey.as_str()) {
+                Ok(pubkey) => pubkey,
+                Err(err) => {
+                    tracing::warn!(
+                        "Skipping initial TPU contact-info entry with invalid pubkey {:?}: {:?}",
+                        node.pubkey,
+                        err
+                    );
+                    return None;
+                }
+            };
+            Some((pubkey, RpcTpuQuicContactInfo::from(&node)))
         })
         .collect::<std::collections::HashMap<_, _>>();
 
@@ -288,19 +325,25 @@ pub async fn rpc_cluster_tpu_info_service(
 
 impl LeaderTpuInfoService for RpcClusterTpuQuicInfoService {
     fn get_quic_tpu_socket_addr(&self, leader_pubkey: &Pubkey) -> Option<SocketAddr> {
-        self.shared
-            .read()
-            .expect("read lock")
-            .get(leader_pubkey)
-            .and_then(|info| info.tpu_quic)
+        match self.shared.read() {
+            Ok(shared) => shared.get(leader_pubkey).and_then(|info| info.tpu_quic),
+            Err(err) => {
+                tracing::error!("TPU contact-info lock poisoned: {:?}", err);
+                None
+            }
+        }
     }
 
     fn get_quic_tpu_fwd_socket_addr(&self, leader_pubkey: &Pubkey) -> Option<SocketAddr> {
-        self.shared
-            .read()
-            .expect("read lock")
-            .get(leader_pubkey)
-            .and_then(|info| info.tpu_forwards_quic)
+        match self.shared.read() {
+            Ok(shared) => shared
+                .get(leader_pubkey)
+                .and_then(|info| info.tpu_forwards_quic),
+            Err(err) => {
+                tracing::error!("TPU contact-info lock poisoned: {:?}", err);
+                None
+            }
+        }
     }
 }
 

@@ -1,6 +1,6 @@
 use {
     quinn::crypto::rustls::QuicServerConfig,
-    rand::Rng,
+    rand::RngExt,
     solana_keypair::Keypair,
     solana_streamer::nonblocking::quic::ALPN_TPU_PROTOCOL_ID,
     solana_tls_utils::{SkipClientVerification, new_dummy_x509_certificate},

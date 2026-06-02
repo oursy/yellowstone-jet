@@ -1,11 +1,13 @@
 ///
-/// THIS FILE AS BEEN IMPORTED FROM JET
-/// TODO: CREATE A COMMON LIB
+/// Validator stake cache used by the TPU client connection eviction policy.
 use {
     crate::{core::ValidatorStakeInfoService, rpc::solana_rpc_utils::SolanaRpcErrorKindExt},
     futures::{StreamExt, stream},
     serde::Deserialize,
-    solana_client::{nonblocking::rpc_client::RpcClient, rpc_response::RpcVoteAccountStatus},
+    solana_client::{
+        client_error::ClientError, nonblocking::rpc_client::RpcClient,
+        rpc_response::RpcVoteAccountStatus,
+    },
     solana_pubkey::Pubkey,
     std::{
         collections::HashMap,
@@ -33,12 +35,20 @@ fn extract_node_stake_mapping(
         .current
         .iter()
         .chain(&rpc_vote_account_status.delinquent)
-        .map(|vote_account_info| {
-            Pubkey::from_str(vote_account_info.node_pubkey.as_str())
-                .map(|pubkey| (pubkey, vote_account_info.activated_stake))
+        .filter_map(|vote_account_info| {
+            match Pubkey::from_str(vote_account_info.node_pubkey.as_str()) {
+                Ok(pubkey) => Some((pubkey, vote_account_info.activated_stake)),
+                Err(err) => {
+                    tracing::warn!(
+                        "Skipping validator stake entry with invalid node pubkey {:?}: {:?}",
+                        vote_account_info.node_pubkey,
+                        err
+                    );
+                    None
+                }
+            }
         })
-        .collect::<Result<HashMap<_, _>, _>>()
-        .expect("Failed to parse validator accounts")
+        .collect::<HashMap<_, _>>()
 }
 
 struct StakeInfoMapInner {
@@ -76,7 +86,11 @@ impl RefreshStakeInfoMapTask {
                     tracing::error!("Failed to get epoch info: {:?}", err);
                     return;
                 } else {
-                    panic!("Failed to get epoch info: {err:?}");
+                    tracing::error!(
+                        "Failed to get epoch info; keeping previous stake snapshot: {:?}",
+                        err
+                    );
+                    return;
                 }
             }
         };
@@ -94,15 +108,25 @@ impl RefreshStakeInfoMapTask {
                 let stake_mappings = extract_node_stake_mapping(resp);
                 let total_stake = stake_mappings.values().sum();
                 // BECAREFUL : WE SHOULD NEVER HOLD THE LOCK ACROSS AN AWAIT POINT.
-                let mut shared = self.shared.write().expect("lock poisoned");
-                shared.mapping = stake_mappings;
-                shared.total_stake = total_stake;
+                match self.shared.write() {
+                    Ok(mut shared) => {
+                        shared.mapping = stake_mappings;
+                        shared.total_stake = total_stake;
+                    }
+                    Err(err) => {
+                        tracing::error!("Stake info map lock poisoned: {:?}", err);
+                        return;
+                    }
+                }
             }
             Err(err) => {
                 if err.is_transient() {
                     tracing::error!("Failed to get vote accounts: {err:?}");
                 } else {
-                    panic!("Failed to get vote accounts: {err:?}");
+                    tracing::error!(
+                        "Failed to get vote accounts; keeping previous stake snapshot: {:?}",
+                        err
+                    );
                 }
             }
         }
@@ -185,8 +209,13 @@ pub struct RpcValidatorStakeInfoService {
 
 impl ValidatorStakeInfoService for RpcValidatorStakeInfoService {
     fn get_stake_info(&self, validator_identity: &Pubkey) -> Option<u64> {
-        let shared = self.inner.read().expect("read");
-        shared.mapping.get(validator_identity).copied()
+        match self.inner.read() {
+            Ok(shared) => shared.mapping.get(validator_identity).copied(),
+            Err(err) => {
+                tracing::error!("Stake info map lock poisoned: {:?}", err);
+                None
+            }
+        }
     }
 }
 
@@ -195,8 +224,13 @@ impl RpcValidatorStakeInfoService {
     /// Get the total stake across all validators.
     ///
     pub fn get_total_stake(&self) -> u64 {
-        let shared = self.inner.read().expect("read");
-        shared.total_stake
+        match self.inner.read() {
+            Ok(shared) => shared.total_stake,
+            Err(err) => {
+                tracing::error!("Stake info map lock poisoned: {:?}", err);
+                0
+            }
+        }
     }
 }
 
@@ -230,17 +264,10 @@ pub(crate) async fn build_validator_stake_info_service_inner(
     rpc: Arc<RpcClient>,
     config: RpcValidatorStakeInfoServiceConfig,
     cnc_rx: Option<mpsc::Receiver<CacheStakeInfoMapCommand>>,
-) -> (RpcValidatorStakeInfoService, JoinHandle<()>) {
-    let initial_value = rpc
-        .get_vote_accounts()
-        .await
-        .expect("Failed to get vote accounts");
+) -> Result<(RpcValidatorStakeInfoService, JoinHandle<()>), ClientError> {
+    let initial_value = rpc.get_vote_accounts().await?;
 
-    let current_epoch = rpc
-        .get_epoch_info()
-        .await
-        .expect("Failed to get epoch info")
-        .epoch;
+    let current_epoch = rpc.get_epoch_info().await?.epoch;
     let initial_stake_mappings = extract_node_stake_mapping(initial_value);
     let total_stakes = initial_stake_mappings.values().sum();
 
@@ -269,7 +296,7 @@ pub(crate) async fn build_validator_stake_info_service_inner(
 
     let jh = tokio::spawn(task.run());
 
-    (ret, jh)
+    Ok((ret, jh))
 }
 
 ///
@@ -290,7 +317,7 @@ pub(crate) async fn build_validator_stake_info_service_inner(
 pub async fn rpc_validator_stake_info_service(
     rpc: Arc<RpcClient>,
     config: RpcValidatorStakeInfoServiceConfig,
-) -> (RpcValidatorStakeInfoService, JoinHandle<()>) {
+) -> Result<(RpcValidatorStakeInfoService, JoinHandle<()>), ClientError> {
     build_validator_stake_info_service_inner(rpc, config, None).await
 }
 
@@ -360,7 +387,9 @@ pub mod tests {
             mock_rpc_sender.clone(),
             RpcClientConfig::default(),
         ));
-        let (stake_info_map, _handle) = stake::rpc_validator_stake_info_service(mock, config).await;
+        let (stake_info_map, _handle) = stake::rpc_validator_stake_info_service(mock, config)
+            .await
+            .expect("stake info service");
 
         let actual = stake_info_map
             .get_stake_info(&node_kp1.pubkey())
@@ -376,20 +405,15 @@ pub mod tests {
     }
 
     #[tokio::test]
-    pub async fn it_should_panic_during_spawn_if_rpc_error() {
+    pub async fn it_should_return_error_during_spawn_if_rpc_error() {
         let mock_rpc_sender = MockRpcSender::all_fatal_errors();
         let mock = Arc::new(RpcClient::new_sender(
             mock_rpc_sender,
             RpcClientConfig::default(),
         ));
-        tokio::spawn(async move {
-            stake::build_validator_stake_info_service_inner(mock, Default::default(), None)
-                .await
-                .1
-                .await
-        })
-        .await
-        .expect_err("should panic");
+        let result =
+            stake::build_validator_stake_info_service_inner(mock, Default::default(), None).await;
+        assert!(result.is_err());
     }
 
     #[tokio::test]
@@ -418,7 +442,9 @@ pub mod tests {
             refresh_interval: std::time::Duration::from_secs(1),
         };
         let (stake_info_map, cache_fresh_fut) =
-            stake::build_validator_stake_info_service_inner(mock, config, Some(cnc_rx)).await;
+            stake::build_validator_stake_info_service_inner(mock, config, Some(cnc_rx))
+                .await
+                .expect("stake info service");
 
         let handle = tokio::spawn(cache_fresh_fut);
 
@@ -505,7 +531,9 @@ pub mod tests {
             refresh_interval: std::time::Duration::from_secs(1),
         };
         let (stake_info_map, handle) =
-            stake::build_validator_stake_info_service_inner(mock, config, Some(cnc_rx)).await;
+            stake::build_validator_stake_info_service_inner(mock, config, Some(cnc_rx))
+                .await
+                .expect("stake info service");
 
         let actual = stake_info_map.get_total_stake();
         assert_eq!(actual, 1100);
@@ -537,7 +565,7 @@ pub mod tests {
     }
 
     #[tokio::test]
-    pub async fn it_should_panic_on_non_transient_error() {
+    pub async fn it_should_keep_previous_stake_info_on_non_transient_error() {
         let node_kp1 = Keypair::new();
         let node_kp2 = Keypair::new();
         let info1 = mock_rpc_vote_account_info(node_kp1.pubkey(), 100);
@@ -563,7 +591,9 @@ pub mod tests {
         };
 
         let (stake_info_map, handle) =
-            stake::build_validator_stake_info_service_inner(mock, config, Some(cnc_rx)).await;
+            stake::build_validator_stake_info_service_inner(mock, config, Some(cnc_rx))
+                .await
+                .expect("stake info service");
 
         let actual = stake_info_map.get_total_stake();
         assert_eq!(actual, 1100);
@@ -579,9 +609,13 @@ pub mod tests {
             .await
             .expect("send failed");
 
-        // If callback return an error it means it panic
-        cb_rx.await.expect_err("callback");
+        cb_rx.await.expect("callback");
+        assert_eq!(stake_info_map.get_total_stake(), 1100);
+        cnc_tx
+            .send(CacheStakeInfoMapCommand::Stop)
+            .await
+            .expect("send failed");
         drop(stake_info_map);
-        handle.await.expect_err("handle");
+        handle.await.expect("task failed");
     }
 }

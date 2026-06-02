@@ -37,13 +37,38 @@ pub struct YellowstoneUpcomingLeader {
 
 impl UpcomingLeaderPredictor for YellowstoneUpcomingLeader {
     fn try_predict_next_n_leaders(&self, n: usize) -> Vec<Pubkey> {
-        let slot = self.slot_tracker.load().expect("load");
+        let slot = match self.slot_tracker.load() {
+            Ok(slot) => slot,
+            Err(err) => {
+                tracing::warn!(
+                    "Yellowstone upcoming leader prediction skipped; slot tracker unavailable: {:?}",
+                    err
+                );
+                return Vec::new();
+            }
+        };
         let reminder = slot % 4;
 
         let next_leader_boundary = slot + (4 - reminder);
-        (0..n)
-            .map(|i| next_leader_boundary + (i * 4) as u64)
-            .flat_map(|s| self.managed_schedule.get_leader(s).expect("get_leader"))
-            .collect()
+        let mut leaders = Vec::with_capacity(n);
+        for leader_slot in (0..n).map(|i| next_leader_boundary + (i * 4) as u64) {
+            match self.managed_schedule.get_leader(leader_slot) {
+                Ok(Some(leader)) => leaders.push(leader),
+                Ok(None) => {
+                    tracing::warn!(
+                        "Yellowstone upcoming leader prediction skipped missing leader for slot {}",
+                        leader_slot
+                    );
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        "Yellowstone upcoming leader prediction skipped; schedule unavailable: {:?}",
+                        err
+                    );
+                    return Vec::new();
+                }
+            }
+        }
+        leaders
     }
 }

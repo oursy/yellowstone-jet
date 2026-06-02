@@ -8,6 +8,7 @@ use {
     solana_pubkey::Pubkey,
     solana_signature::Signature,
     solana_signer::Signer,
+    solana_tls_utils::get_pubkey_from_tls_certificate,
     std::{
         array,
         collections::{HashMap, HashSet},
@@ -33,6 +34,16 @@ use {
         },
     },
 };
+
+fn get_remote_pubkey(connection: &quinn::Connection) -> Option<Pubkey> {
+    connection
+        .peer_identity()?
+        .downcast::<Vec<rustls::pki_types::CertificateDer>>()
+        .ok()
+        .filter(|certs| certs.len() == 1)?
+        .first()
+        .and_then(get_pubkey_from_tls_certificate)
+}
 
 #[derive(Clone)]
 pub struct MockStakeInfoMap {
@@ -166,8 +177,7 @@ impl MockedRemoteValidator {
                 let new_connection_id = connection_id;
                 let conn = connecting.await.expect("quinn connection");
                 connection_id += 1;
-                let remote_key = solana_streamer::nonblocking::quic::get_remote_pubkey(&conn)
-                    .expect("get remote pubkey");
+                let remote_key = get_remote_pubkey(&conn).expect("get remote pubkey");
                 if let Some(tx) = notifiers.connection_established_notify.as_ref() {
                     let _ = tx
                         .send(MockConnectionEstablished {

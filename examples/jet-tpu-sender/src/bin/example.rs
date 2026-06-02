@@ -1,4 +1,3 @@
-
 use {
     clap::Parser,
     solana_client::nonblocking::rpc_client::RpcClient,
@@ -10,18 +9,9 @@ use {
     solana_signer::Signer,
     solana_system_interface::instruction::transfer,
     solana_transaction::versioned::VersionedTransaction,
-    std::{
-        env,
-        path::PathBuf,
-        sync::Arc,
-        vec,
-    },
-    yellowstone_jet_tpu_client::{
-        core::TpuSenderResponse,
-        yellowstone_grpc::sender::{
-            Endpoints, NewYellowstoneTpuSender, YellowstoneTpuSender,
-            create_yellowstone_tpu_sender_with_callback,
-        },
+    std::{env, path::PathBuf, sync::Arc, vec},
+    yellowstone_jet_tpu_client::yellowstone_grpc::sender::{
+        Endpoints, NewYellowstoneTpuSender, YellowstoneTpuSender, create_yellowstone_tpu_sender,
     },
 };
 
@@ -49,7 +39,7 @@ struct Args {
 }
 
 async fn send_lamports(
-    mut tpu_sender: YellowstoneTpuSender,
+    tpu_sender: YellowstoneTpuSender,
     identity: &Keypair,
     recipient: &Pubkey,
     lamports: u64,
@@ -149,18 +139,12 @@ async fn main() {
         grpc_x_token,
     };
 
-    let (callback_tx, mut callback_rx) = tokio::sync::mpsc::unbounded_channel();
     let NewYellowstoneTpuSender {
         sender,
         related_objects_jh: _,
-    } = create_yellowstone_tpu_sender_with_callback(
-        Default::default(),
-        identity.insecure_clone(),
-        endpoints,
-        callback_tx,
-    )
-    .await
-    .expect("tpu-sender");
+    } = create_yellowstone_tpu_sender(Default::default(), identity.insecure_clone(), endpoints)
+        .await
+        .expect("tpu-sender");
 
     const LAMPORTS: u64 = 1000;
 
@@ -177,23 +161,9 @@ async fn main() {
     )
     .await;
 
-    let TpuSenderResponse::TxSent(resp) = callback_rx
-        .recv()
-        .await
-        .expect("receive tpu sender response")
-    else {
-        panic!("unexpected tpu sender response");
-    };
-
-    assert!(
-        resp.tx_sig == signature,
-        "unexpected tx signature in response"
-    );
-
     writeln!(
         &mut out,
-        "sent transaction with signature `{}` to validator `{}`",
-        resp.tx_sig, resp.remote_peer_identity
+        "submitted transaction with signature `{signature}`"
     )
     .expect("writeln");
 }

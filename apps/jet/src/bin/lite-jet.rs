@@ -40,14 +40,9 @@ use {
         transactions::SendTransactionRequest,
         util::WaitShutdown,
     },
-    yellowstone_jet_tpu_client::{
-        core::{TpuSenderResponse, TpuSenderResponseCallback},
-        yellowstone_grpc::sender::{
-            Endpoints, NewYellowstoneTpuSender, ShieldBlockList, YellowstoneTpuSender,
-            create_yellowstone_tpu_sender_with_callback,
-        },
+    yellowstone_jet_tpu_client::yellowstone_grpc::sender::{
+        Endpoints, NewYellowstoneTpuSender, YellowstoneTpuSender, create_yellowstone_tpu_sender,
     },
-    yellowstone_shield_store::PolicyStore,
 };
 
 #[cfg(not(target_env = "msvc"))]
@@ -164,21 +159,6 @@ async fn run_jet(
     )
     .await;
 
-    let shield_policy_store = if config
-        .features
-        .is_feature_enabled(yellowstone_jet::proto::jet::Feature::YellowstoneShield)
-    {
-        let policy_store_config = config.upstream.clone().into();
-        let policy_store = PolicyStore::build()
-            .config(policy_store_config)
-            .run()
-            .await?;
-
-        Some(policy_store)
-    } else {
-        None
-    };
-
     let (geyser, geyser_handle) = GeyserSubscriber::new(
         config.upstream.grpc.clone(),
         !config.send_transaction_service.relay_only_mode,
@@ -194,42 +174,13 @@ async fn run_jet(
         grpc: config.upstream.grpc.endpoint.clone(),
         grpc_x_token: config.upstream.grpc.x_token.clone(),
     };
-    #[derive(Clone)]
-    struct LoggingCallback;
-
-    impl TpuSenderResponseCallback for LoggingCallback {
-        fn call(&self, response: TpuSenderResponse) {
-            use std::io::Write;
-            let mut stdout = std::io::stdout();
-            match response {
-                TpuSenderResponse::TxSent(info) => {
-                    writeln!(
-                        &mut stdout,
-                        "Transaction {} send to {}",
-                        info.tx_sig, info.remote_peer_identity
-                    )
-                    .expect("writeln");
-                }
-                TpuSenderResponse::TxFailed(info) => {
-                    writeln!(&mut stdout, "Transaction failed: {}", info.tx_sig).expect("writeln");
-                }
-                TpuSenderResponse::TxDrop(info) => {
-                    for (txn, _) in info.dropped_tx_vec {
-                        writeln!(&mut stdout, "Transaction dropped: {}", txn.tx_sig)
-                            .expect("writeln");
-                    }
-                }
-            }
-        }
-    }
     let NewYellowstoneTpuSender {
         sender,
         related_objects_jh,
-    } = create_yellowstone_tpu_sender_with_callback(
+    } = create_yellowstone_tpu_sender(
         Default::default(),
         initial_identity.insecure_clone(),
         tpu_sender_endpoints,
-        LoggingCallback,
     )
     .await
     .expect("yellowstone-tpu-sender");
@@ -251,7 +202,6 @@ async fn run_jet(
     let ah = tg.spawn(tpu_sender_loop(
         scheduler_out,
         sender,
-        shield_policy_store,
         jet_cancellation_token.child_token(),
     ));
 
@@ -416,8 +366,7 @@ async fn run_jet(
 /// Example of using jet-tpu-client
 pub async fn tpu_sender_loop(
     mut incoming: UnboundedReceiver<Arc<SendTransactionRequest>>,
-    mut tpu_sender: YellowstoneTpuSender,
-    shield: Option<PolicyStore>,
+    tpu_sender: YellowstoneTpuSender,
     cancellation_token: CancellationToken,
 ) {
     while let Some(request) = incoming.recv().await {
@@ -430,18 +379,10 @@ pub async fn tpu_sender_loop(
             transaction: _,
             wire_transaction,
             max_retries: _,
-            policies,
+            policies: _,
         } = request;
 
-        let blocklist = shield.as_ref().map(|shield| ShieldBlockList {
-            policy_store: shield,
-            shield_policy_addresses: &policies,
-            default_return_value: false,
-        });
-
-        let result = tpu_sender
-            .send_txn_with_blocklist(signature, wire_transaction, blocklist)
-            .await;
+        let result = tpu_sender.send_txn(signature, wire_transaction).await;
         if let Err(e) = result {
             tracing::error!(
                 "failed to send transaction {signature} via TPU: {:?}",

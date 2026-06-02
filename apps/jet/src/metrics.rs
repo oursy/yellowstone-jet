@@ -310,7 +310,6 @@ pub mod jet {
             register!(HTTP_TX_REQUESTS);
             register!(HTTP_TX_REQUEST_DURATION);
 
-            yellowstone_jet_tpu_client::prom::register_metrics(&REGISTRY);
             grpc_lewis::prom::register_metrics(&REGISTRY);
         });
     }

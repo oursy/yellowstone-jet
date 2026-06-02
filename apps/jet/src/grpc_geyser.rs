@@ -28,7 +28,7 @@ use {
     tokio_util::sync::CancellationToken,
     tonic::transport::channel::ClientTlsConfig,
     tracing::{debug, error, info, warn},
-    yellowstone_grpc_client::{GeyserGrpcBuilder, GeyserGrpcClient, Interceptor},
+    yellowstone_grpc_client::{GeyserGrpcBuilder, GeyserGrpcClient},
     yellowstone_grpc_proto::{
         prelude::{
             BlockHeight as GrpcBlockHeight, CommitmentLevel as GrpcCommitmentLevel,
@@ -705,7 +705,7 @@ impl GeyserSubscriber {
         }
     }
 
-    async fn validate_version(geyser: &mut GeyserGrpcClient<impl Interceptor>) -> Result<()> {
+    async fn validate_version(geyser: &mut GeyserGrpcClient) -> Result<()> {
         #[derive(Debug, Deserialize)]
         struct GrpcVersionOld {
             version: String,

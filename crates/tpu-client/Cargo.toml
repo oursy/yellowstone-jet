@@ -1,6 +1,6 @@
 [package]
 name = "yellowstone-jet-tpu-client"
-version = "0.3.1"
+version = "0.4.0"
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
@@ -11,31 +11,41 @@ keywords = ["yellowstone", "solana", "rpc", "tpu", "quic"]
 readme = "README.md"
 publish = true
 exclude = ["src/bin/*"]
+autotests = false
 
 [[bin]]
 name = "test-managed-schedule"
 path = "src/bin/test-managed-schedule.rs"
+required-features = ["examples"]
 
 [[bin]]
 name = "test-tpu-info"
 path = "src/bin/test-tpu-info.rs"
+required-features = ["examples"]
 
 [[bin]]
 name = "test-tpu-send"
 path = "src/bin/test-tpu-send.rs"
+required-features = ["examples"]
 
 [[bin]]
 name = "test-slot-tracker"
 path = "src/bin/test-slot-tracker.rs"
+required-features = ["examples"]
+
+[[test]]
+name = "test_quic_gateway"
+path = "tests/test_quic_gateway.rs"
+required-features = ["intg-testing"]
 
 [features]
 default = ["yellowstone-grpc"]
-prometheus = ["dep:prometheus"]
 examples = [
     "dep:bincode",
     "dep:clap",
     "dep:dotenvy",
     "dep:solana-hash",
+    "dep:solana-message",
     "dep:solana-system-interface",
     "dep:solana-transaction",
     "dep:tracing-subscriber",
@@ -46,37 +56,23 @@ yellowstone-grpc = [
     "dep:yellowstone-grpc-client",
     "dep:yellowstone-grpc-proto",
 ]
-shield = ["dep:yellowstone-shield-store"]
-intg-testing = []
+intg-testing = ["dep:tracing-subscriber"]
 
 [dependencies]
 async-trait = { workspace = true }
-base64 = { workspace = true }
 bincode = { workspace = true, optional = true }
-borsh = { workspace = true }
-bs58 = { workspace = true }
 bytes = { workspace = true }
 clap = { workspace = true, features = ["cargo", "derive", "env"], optional = true }
 derive_more = { workspace = true, features = ["display"] }
 dotenvy = { workspace = true, optional = true }
 futures = { workspace = true }
-hostname = { workspace = true }
-http-body-util = { workspace = true }
 humantime-serde = { workspace = true }
 hyper = { workspace = true }
-lazy_static = { workspace = true }
-maplit = { workspace = true }
-pin-project = { workspace = true }
-prometheus = { workspace = true, optional = true }
 quinn = { workspace = true }
-quinn-proto = { workspace = true }
-rand = { workspace = true }
 retry = { workspace = true }
 rustls = { workspace = true }
-semver = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-serde_yaml = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 tokio-stream = { workspace = true }
@@ -92,25 +88,23 @@ solana-rpc-client-api = { workspace = true }
 solana-streamer = { workspace = true }
 solana-system-interface = { workspace = true, optional = true, features = ["bincode"] }
 solana-tls-utils = { workspace = true, features = ["agave-unstable-api"] }
-solana-version = { workspace = true }
 
 # Solana SDK
-solana-account = { workspace = true }
 solana-clock = { workspace = true }
 solana-commitment-config = { workspace = true }
-solana-epoch-info = { workspace = true }
 solana-hash = { workspace = true, optional = true }
-solana-instruction = { workspace = true }
 solana-keypair = { workspace = true }
-solana-message = { workspace = true }
-solana-packet = { workspace = true }
+solana-message = { workspace = true, optional = true }
 solana-pubkey = { workspace = true }
 solana-signature = { workspace = true, features = ["rand"] }
 solana-signer = { workspace = true }
 solana-transaction = { workspace = true, optional = true }
-solana-transaction-error = { workspace = true }
 
 # Yellowstone
 yellowstone-grpc-client = { workspace = true, optional = true }
 yellowstone-grpc-proto = { workspace = true, optional = true }
-yellowstone-shield-store = { workspace = true, optional = true }
+
+[dev-dependencies]
+rand = { workspace = true }
+serde_yaml = { workspace = true }
+solana-epoch-info = { workspace = true }

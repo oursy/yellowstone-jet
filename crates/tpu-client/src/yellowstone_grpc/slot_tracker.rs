@@ -1,10 +1,10 @@
 use {
     crate::slot::AtomicSlotTracker,
     futures::Stream,
-    std::{collections::HashMap, panic, sync::Arc},
+    std::{collections::HashMap, pin::Pin, sync::Arc, time::Duration},
     tokio::task::JoinHandle,
     tokio_stream::StreamExt,
-    yellowstone_grpc_client::{GeyserGrpcClientResult, Interceptor},
+    yellowstone_grpc_client::{GeyserGrpcClient, GeyserGrpcClientError, GeyserGrpcClientResult},
     yellowstone_grpc_proto::{
         geyser::{
             SubscribeRequest, SubscribeRequestFilterSlots, SubscribeUpdate,
@@ -15,6 +15,11 @@ use {
 };
 
 pub(crate) const SLOT_TRACKER_DM_FILTER_NAME: &str = "jet-tpu-client";
+const SLOT_TRACKER_RECONNECT_INITIAL_BACKOFF: Duration = Duration::from_millis(200);
+const SLOT_TRACKER_RECONNECT_MAX_BACKOFF: Duration = Duration::from_secs(5);
+
+type SlotUpdateStream =
+    Pin<Box<dyn Stream<Item = Result<SubscribeUpdate, Status>> + Send + 'static>>;
 
 pub struct YellowstoneSlotTrackerOk {
     pub atomic_slot_tracker: Arc<AtomicSlotTracker>,
@@ -46,31 +51,79 @@ impl Drop for AutoCloseSlotTracker {
     }
 }
 
-///
-/// Background task to update the AtomicSlotTracker from the Yellowstone Geyser slot stream
-///
-async fn atomic_slot_tracker_loop<S>(mut dm_slot_stream: S, to_drop: AutoCloseSlotTracker)
-where
-    S: Stream<Item = Result<SubscribeUpdate, Status>> + Unpin + Send + 'static,
-{
-    let shared = Arc::clone(&to_drop.slot_tracker);
-    let mut current_slot = shared.slot.load(std::sync::atomic::Ordering::Relaxed);
-    loop {
-        let result = dm_slot_stream.next().await;
-        if result.is_none() {
-            tracing::warn!("Yellowstone slot tracker stream ended");
-            break;
-        }
+#[derive(Debug)]
+enum SlotTrackerStreamExit {
+    Ended,
+    Error(Status),
+}
 
-        let response = match result.unwrap() {
+fn mark_tracker_unavailable(slot_tracker: &AtomicSlotTracker) {
+    slot_tracker
+        .closed
+        .store(true, std::sync::atomic::Ordering::Release);
+}
+
+fn store_slot(slot_tracker: &AtomicSlotTracker, slot: u64) {
+    slot_tracker
+        .slot
+        .store(slot, std::sync::atomic::Ordering::Relaxed);
+    slot_tracker
+        .closed
+        .store(false, std::sync::atomic::Ordering::Release);
+}
+
+async fn wait_for_next_slot(
+    dm_slot_stream: &mut SlotUpdateStream,
+) -> GeyserGrpcClientResult<Option<u64>> {
+    loop {
+        let Some(result) = dm_slot_stream.next().await else {
+            return Ok(None);
+        };
+
+        let response = match result {
             Ok(response) => response,
             Err(err) => {
                 tracing::error!("Yellowstone slot tracker stream error: {:?}", err);
-                drop(to_drop);
-                panic::panic_any(err);
+                return Err(GeyserGrpcClientError::TonicStatus(err));
             }
         };
-        match response.update_oneof.expect("update_oneof") {
+
+        let Some(update) = response.update_oneof else {
+            tracing::warn!("Yellowstone slot tracker received update without payload");
+            continue;
+        };
+
+        if let UpdateOneof::Slot(subscribe_update_slot) = update {
+            return Ok(Some(subscribe_update_slot.slot));
+        }
+    }
+}
+
+async fn process_slot_tracker_stream(
+    dm_slot_stream: &mut SlotUpdateStream,
+    shared: &AtomicSlotTracker,
+) -> SlotTrackerStreamExit {
+    let mut current_slot = shared.slot.load(std::sync::atomic::Ordering::Relaxed);
+    loop {
+        let Some(result) = dm_slot_stream.next().await else {
+            tracing::warn!("Yellowstone slot tracker stream ended");
+            return SlotTrackerStreamExit::Ended;
+        };
+
+        let response = match result {
+            Ok(response) => response,
+            Err(err) => {
+                tracing::error!("Yellowstone slot tracker stream error: {:?}", err);
+                return SlotTrackerStreamExit::Error(err);
+            }
+        };
+
+        let Some(update) = response.update_oneof else {
+            tracing::warn!("Yellowstone slot tracker received update without payload");
+            continue;
+        };
+
+        match update {
             UpdateOneof::Slot(subscribe_update_slot) => {
                 let slot = subscribe_update_slot.slot;
                 if slot <= current_slot {
@@ -79,64 +132,109 @@ where
                 }
                 current_slot = slot;
                 tracing::trace!("Yellowstone slot tracker received slot update: {}", slot);
-                shared
-                    .slot
-                    .store(current_slot, std::sync::atomic::Ordering::Relaxed);
+                store_slot(shared, current_slot);
             }
             _ => {
                 // Ignore other updates
             }
         }
     }
+}
+
+///
+/// Background task to update the AtomicSlotTracker from the Yellowstone Geyser slot stream
+///
+#[cfg(test)]
+async fn atomic_slot_tracker_loop<S>(dm_slot_stream: S, to_drop: AutoCloseSlotTracker)
+where
+    S: Stream<Item = Result<SubscribeUpdate, Status>> + Unpin + Send + 'static,
+{
+    let shared = Arc::clone(&to_drop.slot_tracker);
+    let mut boxed_stream: SlotUpdateStream = Box::pin(dm_slot_stream);
+    process_slot_tracker_stream(&mut boxed_stream, &shared).await;
     drop(to_drop);
+}
+
+async fn atomic_slot_tracker_reconnect_loop(
+    mut geyser_client: GeyserGrpcClient,
+    mut dm_slot_stream: SlotUpdateStream,
+    subscribe_request: SubscribeRequest,
+    to_drop: AutoCloseSlotTracker,
+) {
+    let shared = Arc::clone(&to_drop.slot_tracker);
+    let _close_on_exit = to_drop;
+    let mut reconnect_backoff = SLOT_TRACKER_RECONNECT_INITIAL_BACKOFF;
+
+    loop {
+        match process_slot_tracker_stream(&mut dm_slot_stream, &shared).await {
+            SlotTrackerStreamExit::Ended => {
+                tracing::warn!("Yellowstone slot tracker stream ended; reconnecting");
+            }
+            SlotTrackerStreamExit::Error(err) => {
+                tracing::error!(
+                    "Yellowstone slot tracker stream failed; reconnecting: {:?}",
+                    err
+                );
+            }
+        }
+        mark_tracker_unavailable(&shared);
+
+        loop {
+            tokio::time::sleep(reconnect_backoff).await;
+            match geyser_client
+                .subscribe_once(subscribe_request.clone())
+                .await
+            {
+                Ok(stream) => {
+                    tracing::info!("Yellowstone slot tracker stream reconnected");
+                    dm_slot_stream = Box::pin(stream);
+                    reconnect_backoff = SLOT_TRACKER_RECONNECT_INITIAL_BACKOFF;
+                    break;
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        "Yellowstone slot tracker reconnect failed; retrying in {:?}: {:?}",
+                        reconnect_backoff,
+                        err
+                    );
+                    reconnect_backoff = std::cmp::min(
+                        reconnect_backoff.saturating_mul(2),
+                        SLOT_TRACKER_RECONNECT_MAX_BACKOFF,
+                    );
+                }
+            }
+        }
+    }
 }
 
 ///
 /// Creates an [`AtomicSlotTracker`] that tracks the latest slot from Yellowstone Geyser.
 ///
-pub async fn atomic_slot_tracker<I>(
-    mut geyser_client: yellowstone_grpc_client::GeyserGrpcClient<I>,
-) -> GeyserGrpcClientResult<Option<YellowstoneSlotTrackerOk>>
-where
-    I: Interceptor + 'static,
-{
+pub async fn atomic_slot_tracker(
+    mut geyser_client: GeyserGrpcClient,
+) -> GeyserGrpcClientResult<Option<YellowstoneSlotTrackerOk>> {
     let subscribe_request = get_yellowstone_slot_tracker_subscribe_request();
-    let mut stream = geyser_client.subscribe_once(subscribe_request).await?;
+    let mut stream: SlotUpdateStream = Box::pin(
+        geyser_client
+            .subscribe_once(subscribe_request.clone())
+            .await?,
+    );
 
-    let initial_slot: u64;
     // wait for the first slot update to establish the tip
-    loop {
-        let Some(result) = stream.next().await else {
-            return Ok(None);
-        };
-
-        let response = match result {
-            Ok(response) => response,
-            Err(err) => {
-                tracing::error!("Yellowstone slot tracker stream error: {:?}", err);
-                return Err(yellowstone_grpc_client::GeyserGrpcClientError::TonicStatus(
-                    err,
-                ));
-            }
-        };
-
-        match response.update_oneof.expect("update_oneof") {
-            UpdateOneof::Slot(subscribe_update_slot) => {
-                initial_slot = subscribe_update_slot.slot;
-                break;
-            }
-            _ => {
-                // Ignore other updates
-                continue;
-            }
-        }
-    }
+    let Some(initial_slot) = wait_for_next_slot(&mut stream).await? else {
+        return Ok(None);
+    };
 
     let shared: Arc<AtomicSlotTracker> = Arc::new(AtomicSlotTracker::new(initial_slot));
     let to_drop = AutoCloseSlotTracker {
         slot_tracker: Arc::clone(&shared),
     };
-    let jh = tokio::spawn(atomic_slot_tracker_loop(stream, to_drop));
+    let jh = tokio::spawn(atomic_slot_tracker_reconnect_loop(
+        geyser_client,
+        stream,
+        subscribe_request,
+        to_drop,
+    ));
 
     Ok(Some(YellowstoneSlotTrackerOk {
         atomic_slot_tracker: shared,
@@ -232,6 +330,57 @@ mod tests {
 
         assert!(
             slot_tracker
+                .closed
+                .load(std::sync::atomic::Ordering::Relaxed)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_it_should_poison_without_panicking_when_stream_errors() {
+        let slot_tracker = Arc::new(AtomicSlotTracker::new(42));
+        let to_drop = AutoCloseSlotTracker {
+            slot_tracker: Arc::clone(&slot_tracker),
+        };
+
+        let stream = tokio_stream::iter(vec![Err(Status::internal("h2 protocol error"))]);
+        let handle = tokio::spawn(atomic_slot_tracker_loop(stream, to_drop));
+
+        handle
+            .await
+            .expect("slot tracker task should not panic on stream error");
+
+        assert!(slot_tracker.load().is_err());
+        assert!(
+            slot_tracker
+                .closed
+                .load(std::sync::atomic::Ordering::Relaxed)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_slot_tracker_becomes_available_again_when_new_slot_arrives() {
+        let slot_tracker = Arc::new(AtomicSlotTracker::new(42));
+        mark_tracker_unavailable(&slot_tracker);
+        assert!(slot_tracker.load().is_err());
+
+        let mut stream: SlotUpdateStream =
+            Box::pin(tokio_stream::iter(vec![Ok(SubscribeUpdate {
+                update_oneof: Some(UpdateOneof::Slot(SubscribeUpdateSlot {
+                    slot: 43,
+                    dead_error: None,
+                    parent: None,
+                    status: SlotStatus::SlotProcessed as i32,
+                })),
+                filters: vec![SLOT_TRACKER_DM_FILTER_NAME.to_string()],
+                created_at: None,
+            })]));
+
+        let outcome = process_slot_tracker_stream(&mut stream, &slot_tracker).await;
+
+        assert!(matches!(outcome, SlotTrackerStreamExit::Ended));
+        assert_eq!(slot_tracker.load().expect("load"), 43);
+        assert!(
+            !slot_tracker
                 .closed
                 .load(std::sync::atomic::Ordering::Relaxed)
         );

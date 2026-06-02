@@ -1,5 +1,5 @@
 use {
-    rand::Rng,
+    rand::RngExt,
     std::net::{SocketAddr, TcpListener},
 };
 
