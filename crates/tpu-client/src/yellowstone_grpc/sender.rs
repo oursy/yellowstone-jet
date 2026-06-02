@@ -34,6 +34,10 @@ use {
     },
 };
 
+pub use crate::core::{
+    TpuSenderResponse, TpuSenderResponseCallback, TxDrop, TxDropReason, TxFailed, TxSent,
+};
+
 pub const DEFAULT_TPU_SENDER_CHANNEL_CAPACITY: usize = 100_000;
 
 ///
@@ -389,12 +393,16 @@ pub struct NewYellowstoneTpuSender {
 ///
 /// A [`YellowstoneTpuSender`] and its related dependency-task join handle.
 ///
-async fn create_yellowstone_tpu_sender_with_clients(
+async fn create_yellowstone_tpu_sender_with_clients<CB>(
     config: YellowstoneTpuSenderConfig,
     initial_identity: Keypair,
     rpc_client: Arc<rpc_client::RpcClient>,
     grpc_client: GeyserGrpcClient,
-) -> Result<NewYellowstoneTpuSender, CreateTpuSenderError> {
+    callback: Option<CB>,
+) -> Result<NewYellowstoneTpuSender, CreateTpuSenderError>
+where
+    CB: TpuSenderResponseCallback,
+{
     let (tpu_info_service, tpu_info_service_jh) =
         rpc_cluster_tpu_info_service(Arc::clone(&rpc_client), config.tpu_info).await?;
 
@@ -443,7 +451,7 @@ async fn create_yellowstone_tpu_sender_with_clients(
         Arc::new(stake_service.clone()),
         Arc::new(connection_eviction_strategy),
         Arc::new(leader_predictor),
-        None::<Nothing>,
+        callback,
         config.channel_capacity,
     )
     .await;
@@ -495,6 +503,30 @@ pub async fn create_yellowstone_tpu_sender(
     initial_identity: Keypair,
     endpoints: Endpoints,
 ) -> Result<NewYellowstoneTpuSender, CreateTpuSenderError> {
+    create_yellowstone_tpu_sender_inner(config, initial_identity, endpoints, None::<Nothing>).await
+}
+
+pub async fn create_yellowstone_tpu_sender_with_callback<CB>(
+    config: YellowstoneTpuSenderConfig,
+    initial_identity: Keypair,
+    endpoints: Endpoints,
+    callback: CB,
+) -> Result<NewYellowstoneTpuSender, CreateTpuSenderError>
+where
+    CB: TpuSenderResponseCallback,
+{
+    create_yellowstone_tpu_sender_inner(config, initial_identity, endpoints, Some(callback)).await
+}
+
+async fn create_yellowstone_tpu_sender_inner<CB>(
+    config: YellowstoneTpuSenderConfig,
+    initial_identity: Keypair,
+    endpoints: Endpoints,
+    callback: Option<CB>,
+) -> Result<NewYellowstoneTpuSender, CreateTpuSenderError>
+where
+    CB: TpuSenderResponseCallback,
+{
     let Endpoints {
         rpc,
         grpc,
@@ -520,8 +552,14 @@ pub async fn create_yellowstone_tpu_sender(
 
     tracing::debug!("connected to rpc/grpc endpoints");
 
-    create_yellowstone_tpu_sender_with_clients(config, initial_identity, rpc_client, grpc_client)
-        .await
+    create_yellowstone_tpu_sender_with_clients(
+        config,
+        initial_identity,
+        rpc_client,
+        grpc_client,
+        callback,
+    )
+    .await
 }
 
 async fn yellowstone_tpu_deps_overseer(
@@ -661,6 +699,18 @@ mod tests {
         assert_eq!(txn.remote_peer, current_leader);
         assert!(txn_rx.try_recv().is_err());
         assert_eq!(tpu_info.lookup_count(), 0);
+    }
+
+    #[test]
+    fn exposes_sender_factory_with_response_callback() {
+        let source = include_str!("sender.rs");
+        let function_name = ["create_yellowstone_tpu_sender", "with", "callback"].join("_");
+        let public_factory = format!("pub async fn {function_name}");
+
+        assert!(
+            source.contains(&public_factory),
+            "Myrmidon needs a public Yellowstone TPU factory that installs a response callback"
+        );
     }
 
     #[test]
