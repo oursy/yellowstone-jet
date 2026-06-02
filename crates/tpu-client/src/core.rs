@@ -738,6 +738,7 @@ pub struct TxDrop {
 /// Response from the internal TPU sender.
 ///
 #[derive(Debug)]
+#[allow(clippy::enum_variant_names)]
 pub enum TpuSenderResponse {
     /// Transaction sucessfully written to a QUIC STREAM Frame.
     TxSent(TxSent),

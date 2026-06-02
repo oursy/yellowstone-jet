@@ -1,25 +1,27 @@
 use {
     crate::{
-        cluster_tpu_info::ClusterTpuInfo, identity::JetIdentitySyncMember, stake::StakeInfoMap,
+        cluster_tpu_info::ClusterTpuInfo,
+        identity::JetIdentitySyncMember,
+        quic_client::core::{
+            GatewayIdentityUpdater, LeaderTpuInfoService, UpcomingLeaderPredictor,
+            ValidatorStakeInfoService,
+        },
+        stake::StakeInfoMap,
     },
     solana_keypair::Keypair,
     solana_pubkey::Pubkey,
     std::{net::SocketAddr, sync::Arc},
-    yellowstone_jet_tpu_client::core::{
-        LeaderTpuInfoService, TpuSenderIdentityUpdater, UpcomingLeaderPredictor,
-        ValidatorStakeInfoService,
-    },
 };
 
 impl LeaderTpuInfoService for ClusterTpuInfo {
-    fn get_quic_tpu_socket_addr(&self, leader_pubkey: &Pubkey) -> Option<SocketAddr> {
+    fn get_quic_tpu_socket_addr(&self, leader_pubkey: Pubkey) -> Option<SocketAddr> {
         self.get_cluster_nodes()
-            .get(leader_pubkey)
+            .get(&leader_pubkey)
             .and_then(|node| node.tpu_quic)
     }
-    fn get_quic_tpu_fwd_socket_addr(&self, leader_pubkey: &Pubkey) -> Option<SocketAddr> {
+    fn get_quic_tpu_fwd_socket_addr(&self, leader_pubkey: Pubkey) -> Option<SocketAddr> {
         self.get_cluster_nodes()
-            .get(leader_pubkey)
+            .get(&leader_pubkey)
             .and_then(|node| node.tpu_forwards_quic)
     }
 }
@@ -40,7 +42,7 @@ impl ValidatorStakeInfoService for StakeInfoMap {
 }
 
 #[async_trait::async_trait]
-impl JetIdentitySyncMember for TpuSenderIdentityUpdater {
+impl JetIdentitySyncMember for GatewayIdentityUpdater {
     async fn pause_for_identity_update(
         &self,
         new_identity: Keypair,

@@ -7,7 +7,7 @@
 //! This crate exposes a Yellowstone gRPC TPU sender for routing transactions to the current
 //! Solana leader over QUIC.
 //!
-//! The cores async event-loop engine uses [quinn] and [tokio] crates to provide a high-performance QUIC-based transport protocol implementation.
+//! The internal async event-loop engine uses [quinn] and [tokio] crates to provide a high-performance QUIC-based transport protocol implementation.
 //! It is designed to handle the latest Agave network changes and covers all the edge-cases observed in production usage:
 //!
 //! 1. Automatic leader schedule tracking and slot updates
@@ -35,30 +35,37 @@
 //! # feature-flag supports
 //!
 //! - **yellowstone-grpc**: Enable Yellowstone gRPC based TPU sender implementation [`crate::yellowstone_grpc`]
-//! - **bytes** : Enable `bytes` crate based transaction representation support in TPU sender
 //!
 ///
 /// module for top-level cnfiguration objects
 ///
 pub mod config;
 ///
-/// module for the core tpu sending driver logic
+/// module for the internal core tpu sending driver logic
 ///
+#[cfg(any(feature = "examples", feature = "intg-testing"))]
 pub mod core;
+#[cfg(not(any(feature = "examples", feature = "intg-testing")))]
+#[allow(dead_code)]
+mod core;
 ///
 /// module for common tpu sender implementation
 ///
 mod sender;
 
 ///
-/// module for RPC utilities
+/// module for internal RPC utilities
 ///
+#[cfg(any(feature = "examples", feature = "intg-testing"))]
 pub mod rpc;
+#[cfg(not(any(feature = "examples", feature = "intg-testing")))]
+#[allow(dead_code)]
+mod rpc;
 
 ///
-/// module for slot tracking
+/// module for internal slot tracking
 ///
-pub mod slot;
+mod slot;
 
 ///
 /// module to host utility that utilize Yellowstone gRPC services

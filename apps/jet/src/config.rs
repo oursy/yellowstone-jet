@@ -1,5 +1,9 @@
 use {
-    crate::{feature_flags::FeatureSet, util::CommitmentLevel},
+    crate::{
+        feature_flags::FeatureSet,
+        quic_client::core::{DEFAULT_LEADER_DURATION, QuicGatewayConfig},
+        util::CommitmentLevel,
+    },
     anyhow::Context,
     serde::{
         Deserialize,
@@ -15,7 +19,6 @@ use {
         str::FromStr,
     },
     tokio::{fs, time::Duration},
-    yellowstone_jet_tpu_client::{config::TpuSenderConfig, core::DEFAULT_LEADER_DURATION},
     yellowstone_shield_store::{
         PolicyStoreConfig, PolicyStoreGrpcConfig, PolicyStoreRpcConfig, ShieldStoreCommitmentLevel,
     },
@@ -363,7 +366,7 @@ impl ConfigSendTransactionService {
 #[derive(Debug, Clone, Deserialize)]
 pub struct ConfigQuic {
     #[serde(flatten)]
-    pub tpu_sender: TpuSenderConfig,
+    pub tpu_sender: QuicGatewayConfig,
 
     ///
     /// Connection eviction is trigger when the total number of connections in the QUIC gateway exceeds configured

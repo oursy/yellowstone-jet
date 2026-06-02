@@ -5,6 +5,7 @@ use {
         grpc_geyser::GrpcUpdateMessage,
         grpc_lewis::LewisEventHandler,
         metrics::jet as metrics,
+        quic_client::core::{GatewayResponse, GatewayTransaction},
         rooted_transaction_state::{RootedTxEffect, RootedTxEvent, RootedTxStateMachine},
         util::CommitmentLevel,
     },
@@ -24,7 +25,6 @@ use {
         time::Instant,
     },
     tracing::error,
-    yellowstone_jet_tpu_client::core::{TpuSenderResponse, TpuSenderTxn},
     yellowstone_shield_store::{CheckError, PolicyStoreTrait},
 };
 
@@ -555,8 +555,8 @@ pub enum FanoutConfig {
 pub struct TransactionFanout {
     leader_schedule_service: Arc<dyn UpcomingLeaderSchedule + Send + Sync + 'static>,
     policy_store_service: Arc<dyn TransactionPolicyStore + Send + Sync + 'static>,
-    tpu_sender: mpsc::Sender<TpuSenderTxn>,
-    gateway_response_rx: mpsc::UnboundedReceiver<TpuSenderResponse>,
+    tpu_sender: mpsc::Sender<GatewayTransaction>,
+    gateway_response_rx: mpsc::UnboundedReceiver<GatewayResponse>,
     incoming_transaction_rx: mpsc::UnboundedReceiver<Arc<SendTransactionRequest>>,
     transaction_send_set: JoinSet<Result<Signature, SendTransactionError>>,
     transaction_send_set_meta: HashMap<task::Id, Signature>,
@@ -598,8 +598,8 @@ pub struct TransactionSchedulerBidi {
 }
 
 pub struct QuicGatewayBidi {
-    pub sink: mpsc::Sender<TpuSenderTxn>,
-    pub source: mpsc::UnboundedReceiver<TpuSenderResponse>,
+    pub sink: mpsc::Sender<GatewayTransaction>,
+    pub source: mpsc::UnboundedReceiver<GatewayResponse>,
 }
 
 // The following example illustrates the transaction fanout architecture up to 3 remote validators.
@@ -685,14 +685,14 @@ impl TransactionFanout {
         }
     }
 
-    fn handle_gateway_response(&mut self, response: &TpuSenderResponse) {
+    fn handle_gateway_response(&mut self, response: &GatewayResponse) {
         // Forward to Lewis if handler is configured
         if let Some(handler) = &self.lewis_handler {
             let current_slot = self.leader_schedule_service.get_current_slot();
             handler.handle_gateway_response(response, current_slot);
         }
         match response {
-            TpuSenderResponse::TxSent(gateway_tx_sent) => {
+            GatewayResponse::TxSent(gateway_tx_sent) => {
                 let tx_sig = gateway_tx_sent.tx_sig;
                 // BECAREFUL: THE SAME TRANSACTION CAN BE SENT TO MULTIPLE LEADERS,
                 // SO REMOVE MAY RETURN FALSE.
@@ -702,13 +702,13 @@ impl TransactionFanout {
                     gateway_tx_sent.remote_peer_identity
                 );
             }
-            TpuSenderResponse::TxFailed(gateway_tx_failed) => {
+            GatewayResponse::TxFailed(gateway_tx_failed) => {
                 let tx_sig = gateway_tx_failed.tx_sig;
                 tracing::trace!("transaction {tx_sig} failed");
                 self.inflight_transactions.remove(&tx_sig);
             }
-            TpuSenderResponse::TxDrop(tx_drop) => {
-                for (gw_tx, _curr_attempt) in &tx_drop.dropped_tx_vec {
+            GatewayResponse::TxDrop(tx_drop) => {
+                for (gw_tx, _curr_attempt) in &tx_drop.dropped_gateway_tx_vec {
                     let tx_sig = gw_tx.tx_sig;
                     tracing::trace!("transaction {tx_sig} dropped by QUIC gateway");
                     self.inflight_transactions.remove(&tx_sig);
@@ -784,7 +784,11 @@ impl TransactionFanout {
                     continue;
                 }
                 sent_mask[i] = true;
-                let tpu_txn = TpuSenderTxn::from_bytes(tx.signature, *dest, txn_wire.clone());
+                let tpu_txn = GatewayTransaction {
+                    tx_sig: tx.signature,
+                    remote_peer: *dest,
+                    wire: txn_wire.clone(),
+                };
                 tpu_sink
                     .send(tpu_txn)
                     .await
@@ -802,7 +806,11 @@ impl TransactionFanout {
                     continue;
                 }
 
-                let tpu_txn = TpuSenderTxn::from_bytes(tx.signature, *extra, txn_wire.clone());
+                let tpu_txn = GatewayTransaction {
+                    tx_sig: tx.signature,
+                    remote_peer: *extra,
+                    wire: txn_wire.clone(),
+                };
 
                 tpu_sink
                     .send(tpu_txn)

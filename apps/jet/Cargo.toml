@@ -60,6 +60,7 @@ uuid = { workspace = true, features = ["v4", "serde"] }
 # Agave Monorepo
 solana-bincode = { workspace = true }
 solana-client = { workspace = true }
+solana-net-utils = { workspace = true }
 solana-rpc-client = { workspace = true }
 solana-rpc-client-api = { workspace = true }
 solana-streamer = { workspace = true }

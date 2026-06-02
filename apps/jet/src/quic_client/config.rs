@@ -4,12 +4,17 @@ use {
     std::net::SocketAddr,
 };
 
-#[derive(Debug, Default, Clone, Copy, Deserialize)]
+#[derive(Debug, Clone, Copy, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ConfigQuicTpuPort {
-    #[default]
     Normal,
     Forwards,
+}
+
+impl Default for ConfigQuicTpuPort {
+    fn default() -> Self {
+        Self::Forwards
+    }
 }
 
 ///

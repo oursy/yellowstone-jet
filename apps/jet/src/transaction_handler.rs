@@ -1,7 +1,7 @@
 use {
     crate::{
-        payload::JetRpcSendTransactionConfig, solana::decode_and_deserialize,
-        transactions::SendTransactionRequest,
+        payload::JetRpcSendTransactionConfig, quic_client::core::PACKET_DATA_SIZE,
+        solana::decode_and_deserialize, transactions::SendTransactionRequest,
     },
     anyhow::Result,
     bytes::Bytes,
@@ -14,7 +14,6 @@ use {
     std::sync::Arc,
     thiserror::Error,
     tokio::sync::mpsc,
-    yellowstone_jet_tpu_client::core::PACKET_DATA_SIZE,
 };
 
 #[derive(Debug, Error)]

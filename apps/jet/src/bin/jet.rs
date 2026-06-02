@@ -40,6 +40,11 @@ use {
         identity::{JetIdentitySyncGroup, JetIdentitySyncMember},
         jet_gateway::spawn_jet_gw_listener,
         metrics::{REGISTRY, collect_to_text, jet as metrics},
+        quic_client::core::{
+            IgnorantLeaderPredictor, LeaderTpuInfoService, OverrideTpuInfoService,
+            StakeBasedEvictionStrategy, TokioQuicGatewaySession, TokioQuicGatewaySpawner,
+            UpcomingLeaderPredictor,
+        },
         rpc::{RpcServer, RpcServerType, rpc_admin::RpcClient},
         setup_tracing,
         solana_rpc_utils::{RetryRpcSender, RetryRpcSenderStrategy},
@@ -51,11 +56,6 @@ use {
             TransactionRetryScheduler, TransactionRetrySchedulerConfig,
         },
         util::{WaitShutdown, prom::inject_job_label},
-    },
-    yellowstone_jet_tpu_client::core::{
-        IgnorantLeaderPredictor, LeaderTpuInfoService, OverrideTpuInfoService,
-        StakeBasedEvictionStrategy, TpuSenderDriverSpawner, TpuSenderSessionContext,
-        UpcomingLeaderPredictor,
     },
     yellowstone_shield_store::PolicyStore,
 };
@@ -333,9 +333,9 @@ async fn run_jet(
             other: cluster_tpu_info.clone(),
         });
 
-    let quic_gateway_spawner = TpuSenderDriverSpawner {
+    let quic_gateway_spawner = TokioQuicGatewaySpawner {
         stake_info_map: Arc::new(stake_info_map.clone()),
-        driver_tx_channel_capacity: 10000,
+        gateway_tx_channel_capacity: 10000,
         leader_tpu_info_service,
     };
 
@@ -345,11 +345,11 @@ async fn run_jet(
         Arc::new(IgnorantLeaderPredictor)
     };
 
-    let (gateway_callback_tx, gateway_response_source) = tokio::sync::mpsc::unbounded_channel();
-    let TpuSenderSessionContext {
-        identity_updater: gateway_identity_updater,
-        driver_tx_sink: gateway_tx_sink,
-        driver_join_handle: gateway_join_handle,
+    let TokioQuicGatewaySession {
+        gateway_identity_updater,
+        gateway_tx_sink,
+        gateway_response_source,
+        gateway_join_handle,
     } = quic_gateway_spawner.spawn(
         initial_identity.insecure_clone(),
         config.quic.tpu_sender.clone(),
@@ -357,7 +357,6 @@ async fn run_jet(
             peer_idle_eviction_grace_period: config.quic.connection_idle_eviction_grace,
         }),
         connection_predictor,
-        Some(gateway_callback_tx),
     );
 
     let ah = tg.spawn(async move {

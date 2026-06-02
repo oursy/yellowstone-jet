@@ -54,6 +54,7 @@ use {
         WriteError, crypto::rustls::QuicClientConfig,
     },
     rustls::{NamedGroup, crypto::CryptoProvider},
+    serde::{Deserialize, Deserializer},
     solana_clock::{DEFAULT_MS_PER_SLOT, NUM_CONSECUTIVE_LEADER_SLOTS},
     solana_keypair::Keypair,
     solana_net_utils::{PortRange, VALIDATOR_PORT_RANGE},
@@ -67,6 +68,7 @@ use {
         collections::{BTreeMap, HashMap, HashSet, VecDeque},
         net::{IpAddr, Ipv4Addr, SocketAddr},
         num::NonZeroUsize,
+        ops::Range,
         sync::{Arc, Mutex as StdMutex, atomic::AtomicBool},
         task::Poll,
         time::{Duration, Instant},
@@ -81,6 +83,8 @@ use {
         time::interval,
     },
 };
+
+pub const PACKET_DATA_SIZE: usize = 1232;
 
 ///
 /// Each [`quinn::Endpoint`] has its own event-loop.
@@ -105,6 +109,13 @@ pub const DEFAULT_TX_SEND_TIMEOUT: Duration = Duration::from_secs(2);
 
 pub const DEFAULT_LEADER_PREDICTION_LOOKAHEAD: NonZeroUsize = NonZeroUsize::new(4).unwrap();
 
+fn deserialize_port_range<'de, D>(deserializer: D) -> Result<PortRange, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Range::deserialize(deserializer).map(|range| (range.start, range.end))
+}
+
 #[derive(thiserror::Error, Debug)]
 pub(crate) enum ConnectingError {
     #[error(transparent)]
@@ -115,9 +126,19 @@ pub(crate) enum ConnectingError {
     PeerNotInLeaderSchedule,
 }
 
+#[derive(Debug, Clone, Deserialize)]
 pub struct QuicGatewayConfig {
+    #[serde(
+        deserialize_with = "deserialize_port_range",
+        default = "QuicGatewayConfig::default_port_range",
+        alias = "endpoint_port_range"
+    )]
     pub port_range: PortRange,
 
+    #[serde(
+        default = "QuicGatewayConfig::default_max_idle_timeout",
+        with = "humantime_serde"
+    )]
     pub max_idle_timeout: Duration,
 
     // TODO check if we really need keep alive interval.
@@ -126,25 +147,41 @@ pub struct QuicGatewayConfig {
     ///
     /// Maximum number of consecutive connection attempts
     ///
+    #[serde(default = "QuicGatewayConfig::default_max_connection_attempts")]
     pub max_connection_attempts: usize,
 
     ///
     /// Capacity of the transaction sender worker channel per remote peer.
     ///
+    #[serde(default = "QuicGatewayConfig::default_transaction_sender_worker_channel_capacity")]
     pub transaction_sender_worker_channel_capacity: usize,
 
     ///
     /// Timeout for establishing a connection to a remote peer.
     ///
+    #[serde(
+        default = "QuicGatewayConfig::default_connection_timeout",
+        alias = "connection_handshake_timeout",
+        with = "humantime_serde"
+    )]
     pub connecting_timeout: Duration,
 
+    #[serde(
+        default = "QuicGatewayConfig::default_tpu_port_kind",
+        alias = "tpu_port"
+    )]
     pub tpu_port_kind: ConfigQuicTpuPort,
 
+    #[serde(
+        default = "QuicGatewayConfig::default_max_concurrent_connections",
+        alias = "max_concurrent_connection"
+    )]
     pub max_concurrent_connections: usize,
 
     ///
     /// Maximum number of attempts to bind a local port to a remote peer.
     ///
+    #[serde(default = "QuicGatewayConfig::default_max_local_port_binding_attempts")]
     pub max_local_port_binding_attempts: usize,
 
     ///
@@ -158,6 +195,10 @@ pub struct QuicGatewayConfig {
     ///
     /// Recommanded try 1 endpoint per 8 CPU cores dedicated to jet.
     ///
+    #[serde(
+        default = "QuicGatewayConfig::default_num_endpoints",
+        alias = "endpoint_count"
+    )]
     pub num_endpoints: NonZeroUsize,
 
     ///
@@ -165,22 +206,95 @@ pub struct QuicGatewayConfig {
     /// Attempt may fail due to connection losts, stream limit exceeded, etc.
     /// It might be useful to retry sending a transaction at least 2-3 times before giving up.
     ///
+    #[serde(
+        default = "QuicGatewayConfig::default_max_send_attempt",
+        alias = "send_retry_count"
+    )]
     pub max_send_attempt: NonZeroUsize,
 
     ///
     /// Interval to watch remote peer address changes.
     ///
+    #[serde(
+        default = "QuicGatewayConfig::default_remote_peer_addr_watch_interval",
+        with = "humantime_serde"
+    )]
     pub remote_peer_addr_watch_interval: Duration,
 
     ///
     /// Timeout for sending a transaction to a remote peer.
     ///
+    #[serde(
+        default = "QuicGatewayConfig::default_send_timeout",
+        with = "humantime_serde"
+    )]
     pub send_timeout: Duration,
 
     ///
     /// Maximum number of leaders to predict
     ///
+    #[serde(
+        default = "QuicGatewayConfig::default_leader_prediction_lookahead",
+        alias = "connection_prediction_lookahead"
+    )]
     pub leader_prediction_lookahead: Option<NonZeroUsize>,
+
+    #[serde(default)]
+    pub tpu_info_override: Vec<TpuOverrideInfo>,
+}
+
+impl QuicGatewayConfig {
+    pub const fn default_port_range() -> PortRange {
+        VALIDATOR_PORT_RANGE
+    }
+
+    pub const fn default_max_idle_timeout() -> Duration {
+        QUIC_MAX_TIMEOUT
+    }
+
+    pub const fn default_max_connection_attempts() -> usize {
+        DEFAULT_MAX_CONSECUTIVE_CONNECTION_ATTEMPT
+    }
+
+    pub const fn default_transaction_sender_worker_channel_capacity() -> usize {
+        DEFAULT_PER_PEER_TRANSACTION_QUEUE_SIZE
+    }
+
+    pub const fn default_connection_timeout() -> Duration {
+        DEFAULT_CONNECTION_TIMEOUT
+    }
+
+    pub const fn default_tpu_port_kind() -> ConfigQuicTpuPort {
+        ConfigQuicTpuPort::Forwards
+    }
+
+    pub const fn default_max_concurrent_connections() -> usize {
+        DEFAULT_MAX_CONCURRENT_CONNECTIONS
+    }
+
+    pub const fn default_max_local_port_binding_attempts() -> usize {
+        DEFAULT_MAX_LOCAL_BINDING_PORT_ATTEMPTS
+    }
+
+    pub const fn default_num_endpoints() -> NonZeroUsize {
+        DEFAULT_QUIC_GATEWAY_ENDPOINT_COUNT
+    }
+
+    pub const fn default_max_send_attempt() -> NonZeroUsize {
+        DEFAULT_MAX_SEND_ATTEMPT
+    }
+
+    pub const fn default_remote_peer_addr_watch_interval() -> Duration {
+        DEFAULT_REMOTE_PEER_ADDR_WATCH_INTERVAL
+    }
+
+    pub const fn default_send_timeout() -> Duration {
+        DEFAULT_TX_SEND_TIMEOUT
+    }
+
+    pub const fn default_leader_prediction_lookahead() -> Option<NonZeroUsize> {
+        Some(DEFAULT_LEADER_PREDICTION_LOOKAHEAD)
+    }
 }
 
 impl Default for QuicGatewayConfig {
@@ -199,6 +313,7 @@ impl Default for QuicGatewayConfig {
             remote_peer_addr_watch_interval: DEFAULT_REMOTE_PEER_ADDR_WATCH_INTERVAL,
             send_timeout: DEFAULT_TX_SEND_TIMEOUT,
             leader_prediction_lookahead: Some(DEFAULT_LEADER_PREDICTION_LOOKAHEAD),
+            tpu_info_override: Vec::new(),
         }
     }
 }

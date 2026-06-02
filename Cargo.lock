@@ -7504,6 +7504,7 @@ dependencies = [
  "solana-keypair",
  "solana-message",
  "solana-native-token",
+ "solana-net-utils",
  "solana-nonce",
  "solana-packet",
  "solana-program",
