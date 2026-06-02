@@ -1,6 +1,6 @@
 use {
     crate::slot::AtomicSlotTracker,
-    futures::Stream,
+    futures::{SinkExt, Stream, channel::mpsc},
     std::{collections::HashMap, pin::Pin, sync::Arc, time::Duration},
     tokio::task::JoinHandle,
     tokio_stream::StreamExt,
@@ -70,6 +70,19 @@ fn store_slot(slot_tracker: &AtomicSlotTracker, slot: u64) {
     slot_tracker
         .closed
         .store(false, std::sync::atomic::Ordering::Release);
+}
+
+async fn subscribe_slot_tracker_once(
+    geyser_client: &mut GeyserGrpcClient,
+    subscribe_request: SubscribeRequest,
+) -> GeyserGrpcClientResult<SlotUpdateStream> {
+    let (mut subscribe_tx, subscribe_rx) = mpsc::unbounded();
+    subscribe_tx
+        .send(subscribe_request)
+        .await
+        .map_err(|err| GeyserGrpcClientError::TonicStatus(Status::internal(err.to_string())))?;
+    let response = geyser_client.geyser.subscribe(subscribe_rx).await?;
+    Ok(Box::pin(response.into_inner()))
 }
 
 async fn wait_for_next_slot(
@@ -181,13 +194,10 @@ async fn atomic_slot_tracker_reconnect_loop(
 
         loop {
             tokio::time::sleep(reconnect_backoff).await;
-            match geyser_client
-                .subscribe_once(subscribe_request.clone())
-                .await
-            {
+            match subscribe_slot_tracker_once(&mut geyser_client, subscribe_request.clone()).await {
                 Ok(stream) => {
                     tracing::info!("Yellowstone slot tracker stream reconnected");
-                    dm_slot_stream = Box::pin(stream);
+                    dm_slot_stream = stream;
                     reconnect_backoff = SLOT_TRACKER_RECONNECT_INITIAL_BACKOFF;
                     break;
                 }
@@ -214,11 +224,8 @@ pub async fn atomic_slot_tracker(
     mut geyser_client: GeyserGrpcClient,
 ) -> GeyserGrpcClientResult<Option<YellowstoneSlotTrackerOk>> {
     let subscribe_request = get_yellowstone_slot_tracker_subscribe_request();
-    let mut stream: SlotUpdateStream = Box::pin(
-        geyser_client
-            .subscribe_once(subscribe_request.clone())
-            .await?,
-    );
+    let mut stream =
+        subscribe_slot_tracker_once(&mut geyser_client, subscribe_request.clone()).await?;
 
     // wait for the first slot update to establish the tip
     let Some(initial_slot) = wait_for_next_slot(&mut stream).await? else {
@@ -383,6 +390,24 @@ mod tests {
             !slot_tracker
                 .closed
                 .load(std::sync::atomic::Ordering::Relaxed)
+        );
+    }
+
+    #[test]
+    fn slot_tracker_bypasses_client_autoreconnect_filter_injection() {
+        let production_source = include_str!("slot_tracker.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production source");
+
+        assert!(
+            !production_source.contains(".subscribe_once("),
+            "slot tracker must not use GeyserGrpcClient::subscribe_once because \
+             yellowstone-grpc-client injects __autoreconnect slot/block_meta filters"
+        );
+        assert!(
+            production_source.contains(".geyser.subscribe("),
+            "slot tracker should send its one-filter request through raw geyser.subscribe"
         );
     }
 }
