@@ -1803,6 +1803,50 @@ where
         }
     }
 
+    fn drop_single_tx(
+        &self,
+        remote_peer_identity: Pubkey,
+        tx: TpuSenderTxn,
+        attempt: usize,
+        reason: TxDropReason,
+    ) {
+        if let Some(callback) = self.response_outlet.as_ref() {
+            let tx_drop = TxDrop {
+                remote_peer_identity,
+                drop_reason: reason,
+                dropped_tx_vec: VecDeque::from([(tx, attempt)]),
+            };
+            callback.call(TpuSenderResponse::TxDrop(tx_drop));
+        }
+    }
+
+    fn queue_tx_or_drop(
+        &mut self,
+        remote_peer_identity: Pubkey,
+        tx: TpuSenderTxn,
+        attempt: usize,
+    ) -> bool {
+        let queued_len = self
+            .tx_queues
+            .get(&remote_peer_identity)
+            .map_or(0, VecDeque::len);
+        if queued_len >= self.config.transaction_sender_worker_channel_capacity {
+            tracing::warn!(
+                "Remote peer: {:?} pending tx queue is full, dropping tx: {:?}",
+                remote_peer_identity,
+                tx.tx_sig
+            );
+            self.drop_single_tx(remote_peer_identity, tx, attempt, TxDropReason::RateLimited);
+            return false;
+        }
+
+        self.tx_queues
+            .entry(remote_peer_identity)
+            .or_default()
+            .push_back((tx, attempt));
+        true
+    }
+
     fn unreachable_peer(&mut self, remote_peer_identity: Pubkey) {
         self.drop_peer_queued_tx(remote_peer_identity, TxDropReason::RemotePeerUnreachable);
     }
@@ -2274,25 +2318,21 @@ where
                     }
                     mpsc::error::TrySendError::Closed(tx) => {
                         tracing::debug!("Enqueuing tx: {tx_id:.10}",);
-                        self.tx_queues
-                            .entry(remote_peer_identity)
-                            .or_default()
-                            .push_back((tx, 1));
+                        self.queue_tx_or_drop(remote_peer_identity, tx, 1);
                     }
                 },
             }
         } else {
             // We don't have any active transaction sender worker for the remote peer,
             // we need to queue the transaction and try to spawn a new connection.
-            self.tx_queues
-                .entry(remote_peer_identity)
-                .or_default()
-                .push_back((tx, 1));
+            let queued = self.queue_tx_or_drop(remote_peer_identity, tx, 1);
             tracing::trace!("queuing tx: {:?}", tx_id);
 
             // Check if we are not already connecting to this remote peer.
             // If the remote peer is already being connected, just queue the tx.
-            self.spawn_connecting(remote_peer_identity, 1, SpawnSource::NewTransaction);
+            if queued {
+                self.spawn_connecting(remote_peer_identity, 1, SpawnSource::NewTransaction);
+            }
         }
     }
 
@@ -2456,12 +2496,11 @@ where
                 // It's possible that the worker failed while having pending transactions.
                 // We need to "rescue" those transactions if any and if the worker didn't fail due to fatal errors.
 
-                let tx_to_rescue = self.tx_queues.entry(remote_peer_identity).or_default();
                 while let Ok(tx) = worker_completed.rx.try_recv() {
-                    tx_to_rescue.push_back((tx, 1));
+                    self.queue_tx_or_drop(remote_peer_identity, tx, 1);
                 }
                 while let Some((tx, attempt)) = worker_completed.pending_tx.pop_front() {
-                    tx_to_rescue.push_back((tx, attempt));
+                    self.queue_tx_or_drop(remote_peer_identity, tx, attempt);
                 }
 
                 let is_peer_unreachable = worker_completed
@@ -2495,7 +2534,11 @@ where
                         remote_peer_identity,
                         TxDropReason::RemotePeerBeingEvicted,
                     );
-                } else if !tx_to_rescue.is_empty() {
+                } else if self
+                    .tx_queues
+                    .get(&remote_peer_identity)
+                    .is_some_and(|tx_to_rescue| !tx_to_rescue.is_empty())
+                {
                     // If the worker didn't have a fatal error and was not evicted and still has queued transactions,
                     // we can safely reattempt to connect to the remote peer.
                     // This can happen to transient network errors or remote peer being temporarily unavailable.
@@ -3480,13 +3523,15 @@ mod test {
             config::TpuSenderConfig,
             core::{
                 IgnorantLeaderPredictor, LeaderTpuInfoService, Nothing, StakeBasedEvictionStrategy,
-                TpuSenderDriverSpawner, ValidatorStakeInfoService,
+                TpuSenderDriverSpawner, TpuSenderResponse, TpuSenderTxn, TxDropReason,
+                ValidatorStakeInfoService,
             },
         },
         solana_keypair::Keypair,
         solana_pubkey::Pubkey,
+        solana_signature::Signature,
         std::{net::SocketAddr, sync::Arc, time::Duration},
-        tokio::sync::mpsc,
+        tokio::{sync::mpsc, time::timeout},
     };
 
     struct EmptyStakeInfo;
@@ -3506,6 +3551,21 @@ mod test {
 
         fn get_quic_tpu_fwd_socket_addr(&self, _leader_pubkey: &Pubkey) -> Option<SocketAddr> {
             None
+        }
+    }
+
+    struct FixedLeaderTpuInfo {
+        remote_peer: Pubkey,
+        addr: SocketAddr,
+    }
+
+    impl LeaderTpuInfoService for FixedLeaderTpuInfo {
+        fn get_quic_tpu_socket_addr(&self, leader_pubkey: &Pubkey) -> Option<SocketAddr> {
+            (*leader_pubkey == self.remote_peer).then_some(self.addr)
+        }
+
+        fn get_quic_tpu_fwd_socket_addr(&self, leader_pubkey: &Pubkey) -> Option<SocketAddr> {
+            (*leader_pubkey == self.remote_peer).then_some(self.addr)
         }
     }
 
@@ -3531,6 +3591,71 @@ mod test {
 
         drop(session.driver_tx_sink);
         session.driver_join_handle.await.expect("driver task");
+    }
+
+    #[tokio::test]
+    async fn pending_connection_queue_is_bounded_by_worker_capacity() {
+        let remote_peer = Pubkey::new_unique();
+        let remote_addr = "127.0.0.1:9".parse().expect("socket addr");
+        let spawner = TpuSenderDriverSpawner {
+            stake_info_map: Arc::new(EmptyStakeInfo),
+            leader_tpu_info_service: Arc::new(FixedLeaderTpuInfo {
+                remote_peer,
+                addr: remote_addr,
+            }),
+            driver_tx_channel_capacity: 8,
+        };
+        let config = TpuSenderConfig {
+            transaction_sender_worker_channel_capacity: 2,
+            connecting_timeout: Duration::from_secs(60),
+            max_connection_attempts: 1,
+            ..Default::default()
+        };
+        let (callback_tx, mut callback_rx) = mpsc::unbounded_channel();
+        let session = spawner.spawn(
+            Keypair::new(),
+            config,
+            Arc::new(StakeBasedEvictionStrategy::default()),
+            Arc::new(IgnorantLeaderPredictor),
+            Some(callback_tx),
+        );
+        let dropped_sig = Signature::new_unique();
+
+        for sig in [
+            Signature::new_unique(),
+            Signature::new_unique(),
+            dropped_sig,
+        ] {
+            session
+                .driver_tx_sink
+                .send(TpuSenderTxn::from_owned(sig, remote_peer, vec![1_u8, 2, 3]))
+                .await
+                .expect("enqueue to driver");
+        }
+
+        let response = timeout(Duration::from_secs(1), callback_rx.recv())
+            .await
+            .expect("rate limit callback")
+            .expect("callback");
+        let TpuSenderResponse::TxDrop(mut dropped) = response else {
+            panic!("expected TxDrop, got {response:?}");
+        };
+
+        assert!(matches!(dropped.drop_reason, TxDropReason::RateLimited));
+        assert_eq!(dropped.remote_peer_identity, remote_peer);
+        let (dropped_tx, attempt) = dropped
+            .dropped_tx_vec
+            .pop_front()
+            .expect("dropped transaction");
+        assert_eq!(dropped_tx.tx_sig, dropped_sig);
+        assert_eq!(attempt, 1);
+        assert!(dropped.dropped_tx_vec.is_empty());
+
+        drop(session.driver_tx_sink);
+        timeout(Duration::from_secs(1), session.driver_join_handle)
+            .await
+            .expect("driver exits")
+            .expect("driver task");
     }
 
     #[tokio::test]

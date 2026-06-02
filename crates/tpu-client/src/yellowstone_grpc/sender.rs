@@ -228,9 +228,10 @@ impl YellowstoneTpuSender {
         sig: Signature,
         wire_txn: &Bytes,
         leader: Pubkey,
-        sent_addr: Option<&mut Option<SocketAddr>>,
+        mut sent_addr: Option<&mut Option<SocketAddr>>,
     ) -> Result<(), SendErrorKind> {
-        if let Some(sent_addr) = sent_addr
+        let mut queued_addr = None;
+        if let Some(sent_addr) = sent_addr.as_deref_mut()
             && let Some(addr) = self
                 .leader_tpu_info
                 .get_quic_dest_addr(&leader, self.tpu_port_kind)
@@ -238,7 +239,7 @@ impl YellowstoneTpuSender {
             if sent_addr.as_ref().is_some_and(|sent| *sent == addr) {
                 return Ok(());
             }
-            *sent_addr = Some(addr);
+            queued_addr = Some(addr);
         }
 
         let tpu_txn = TpuSenderTxn {
@@ -252,6 +253,12 @@ impl YellowstoneTpuSender {
                 TpuSenderErrorKind::Closed => SendErrorKind::Closed,
                 TpuSenderErrorKind::Full => SendErrorKind::Full,
             })?;
+
+        if let Some(sent_addr) = sent_addr
+            && let Some(addr) = queued_addr
+        {
+            *sent_addr = Some(addr);
+        }
 
         Ok(())
     }
@@ -317,23 +324,28 @@ impl YellowstoneTpuSender {
 
             if next_leader != current_leader {
                 let mut sent_addr = None;
-                if let Err(kind) =
-                    self.send_txn_to_leader(sig, &wire_txn, current_leader, Some(&mut sent_addr))
+                let mut first_error = None;
+                let mut sent_any = false;
+                match self.send_txn_to_leader(sig, &wire_txn, current_leader, Some(&mut sent_addr))
                 {
-                    return Err(SendError {
-                        kind,
-                        txn: wire_txn,
-                    });
+                    Ok(()) => sent_any = true,
+                    Err(kind) => first_error = Some(kind),
                 }
-                if let Err(kind) =
-                    self.send_txn_to_leader(sig, &wire_txn, next_leader, Some(&mut sent_addr))
-                {
-                    return Err(SendError {
-                        kind,
-                        txn: wire_txn,
-                    });
+                match self.send_txn_to_leader(sig, &wire_txn, next_leader, Some(&mut sent_addr)) {
+                    Ok(()) => sent_any = true,
+                    Err(kind) => {
+                        if first_error.is_none() {
+                            first_error = Some(kind);
+                        }
+                    }
                 }
-                return Ok(());
+                if sent_any {
+                    return Ok(());
+                }
+                return Err(SendError {
+                    kind: first_error.unwrap_or(SendErrorKind::UnknownLeader),
+                    txn: wire_txn,
+                });
             }
 
             current_leader
@@ -369,6 +381,14 @@ impl YellowstoneTpuSender {
         Ok(())
     }
 
+    /// Enqueues a transaction to the TPU of the current leader without allocating an async future.
+    pub fn try_send_txn<T>(&self, sig: Signature, txn: T) -> Result<(), SendError>
+    where
+        T: AsRef<[u8]> + Send + 'static,
+    {
+        self.send_txn_fanout(sig, txn)
+    }
+
     ///
     /// Sends a transaction to the TPU of the current leader.
     ///
@@ -386,7 +406,7 @@ impl YellowstoneTpuSender {
     where
         T: AsRef<[u8]> + Send + 'static,
     {
-        self.send_txn_fanout(sig, txn)
+        self.try_send_txn(sig, txn)
     }
 }
 
@@ -624,7 +644,16 @@ mod tests {
         leaders: Vec<Pubkey>,
         tpu_info: Arc<CountingTpuInfo>,
     ) -> (YellowstoneTpuSender, mpsc::Receiver<TpuSenderTxn>) {
-        let (txn_tx, txn_rx) = mpsc::channel(8);
+        test_sender_with_capacity(slot, leaders, tpu_info, 8)
+    }
+
+    fn test_sender_with_capacity(
+        slot: u64,
+        leaders: Vec<Pubkey>,
+        tpu_info: Arc<CountingTpuInfo>,
+        capacity: usize,
+    ) -> (YellowstoneTpuSender, mpsc::Receiver<TpuSenderTxn>) {
+        let (txn_tx, txn_rx) = mpsc::channel(capacity);
         let leader_tpu_info: Arc<dyn LeaderTpuInfoService + Send + Sync> = tpu_info;
         let sender = YellowstoneTpuSender {
             base_tpu_sender: TpuSender::new_for_tests(txn_tx),
@@ -655,6 +684,24 @@ mod tests {
         assert_eq!(tpu_info.lookup_count(), 0);
     }
 
+    #[test]
+    fn single_leader_try_send_txn_uses_sync_hot_path() {
+        let current_leader = Pubkey::new_unique();
+        let next_leader = Pubkey::new_unique();
+        let tpu_info = Arc::new(CountingTpuInfo::new(HashMap::new()));
+        let (sender, mut txn_rx) =
+            test_sender(1, vec![current_leader, next_leader], Arc::clone(&tpu_info));
+
+        sender
+            .try_send_txn(Signature::default(), vec![1_u8, 2, 3])
+            .expect("send txn");
+
+        let txn = txn_rx.try_recv().expect("one queued transaction");
+        assert_eq!(txn.remote_peer, current_leader);
+        assert!(txn_rx.try_recv().is_err());
+        assert_eq!(tpu_info.lookup_count(), 0);
+    }
+
     #[tokio::test]
     async fn boundary_fanout_coalesces_duplicate_tpu_addr() {
         let current_leader = Pubkey::new_unique();
@@ -676,5 +723,28 @@ mod tests {
         assert_eq!(txn.remote_peer, current_leader);
         assert!(txn_rx.try_recv().is_err());
         assert_eq!(tpu_info.lookup_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn boundary_fanout_succeeds_when_at_least_one_leader_is_enqueued() {
+        let current_leader = Pubkey::new_unique();
+        let next_leader = Pubkey::new_unique();
+        let current_addr: SocketAddr = "127.0.0.1:9000".parse().expect("socket addr");
+        let next_addr: SocketAddr = "127.0.0.1:9001".parse().expect("socket addr");
+        let tpu_info = Arc::new(CountingTpuInfo::new(HashMap::from([
+            (current_leader, current_addr),
+            (next_leader, next_addr),
+        ])));
+        let (sender, mut txn_rx) =
+            test_sender_with_capacity(2, vec![current_leader, next_leader], tpu_info, 1);
+
+        sender
+            .send_txn(Signature::default(), vec![1_u8, 2, 3])
+            .await
+            .expect("current leader enqueue should make fanout usable");
+
+        let txn = txn_rx.try_recv().expect("current leader transaction");
+        assert_eq!(txn.remote_peer, current_leader);
+        assert!(txn_rx.try_recv().is_err());
     }
 }
