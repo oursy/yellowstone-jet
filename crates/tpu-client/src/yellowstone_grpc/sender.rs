@@ -1,6 +1,6 @@
 use {
     crate::{
-        config::{TpuPortKind, TpuSenderConfig},
+        config::{MAX_SEND_FANOUT_SLOTS, TpuPortKind, TpuSenderConfig},
         core::{Nothing, StakeBasedEvictionStrategy, TpuSenderTxn},
         rpc::{
             schedule::{
@@ -111,7 +111,7 @@ pub enum CreateTpuSenderError {
 /// Core Yellowstone TPU sender.
 ///
 /// The sender tracks the current Yellowstone slot and Solana leader schedule, then routes each
-/// transaction to the current leader and, near a slot boundary, the next leader.
+/// transaction to the current leader and upcoming unique leaders in the configured fanout window.
 ///
 /// See [`create_yellowstone_tpu_sender`] for creation.
 ///
@@ -172,6 +172,7 @@ pub struct YellowstoneTpuSender {
     leader_schedule: ManagedLeaderSchedule,
     leader_tpu_info: Arc<dyn crate::core::LeaderTpuInfoService + Send + Sync>,
     tpu_port_kind: TpuPortKind,
+    send_fanout_slots: u64,
 }
 
 ///
@@ -277,108 +278,54 @@ impl YellowstoneTpuSender {
                 });
             }
         };
-        let reminder = current_slot % 4;
-        let floor_leader_boundary = current_slot.saturating_sub(reminder);
-
-        // Each leader gets 4 slots
-        let target_leader = if reminder >= 2 {
-            let leader_boundaries = [floor_leader_boundary, floor_leader_boundary + 4];
-            let leaders = match self
-                .leader_schedule
-                .get_leaders_for_slots(leader_boundaries)
-            {
-                Ok(leaders) => leaders,
-                Err(_) => {
-                    return Err(SendError {
-                        kind: SendErrorKind::ManagedLeaderScheduleDisconnected,
-                        txn: wire_txn,
-                    });
-                }
-            };
-            let current_leader = match leaders[0] {
-                Some(leader) => leader,
-                None => {
-                    tracing::warn!(
-                        "Yellowstone TPU sender missing leader for slot boundary {}",
-                        leader_boundaries[0]
-                    );
-                    return Err(SendError {
-                        kind: SendErrorKind::UnknownLeader,
-                        txn: wire_txn,
-                    });
-                }
-            };
-            let next_leader = match leaders[1] {
-                Some(leader) => leader,
-                None => {
-                    tracing::warn!(
-                        "Yellowstone TPU sender missing leader for slot boundary {}",
-                        leader_boundaries[1]
-                    );
-                    return Err(SendError {
-                        kind: SendErrorKind::UnknownLeader,
-                        txn: wire_txn,
-                    });
-                }
-            };
-
-            if next_leader != current_leader {
-                let mut sent_addr = None;
-                let mut first_error = None;
-                let mut sent_any = false;
-                match self.send_txn_to_leader(sig, &wire_txn, current_leader, Some(&mut sent_addr))
-                {
-                    Ok(()) => sent_any = true,
-                    Err(kind) => first_error = Some(kind),
-                }
-                match self.send_txn_to_leader(sig, &wire_txn, next_leader, Some(&mut sent_addr)) {
-                    Ok(()) => sent_any = true,
-                    Err(kind) => {
-                        if first_error.is_none() {
-                            first_error = Some(kind);
-                        }
-                    }
-                }
-                if sent_any {
-                    return Ok(());
-                }
+        let leaders = match self
+            .leader_schedule
+            .get_unique_leaders_for_slot_fanout(current_slot, self.send_fanout_slots)
+        {
+            Ok(leaders) => leaders,
+            Err(_) => {
                 return Err(SendError {
-                    kind: first_error.unwrap_or(SendErrorKind::UnknownLeader),
+                    kind: SendErrorKind::ManagedLeaderScheduleDisconnected,
                     txn: wire_txn,
                 });
             }
-
-            current_leader
-        } else {
-            match self.leader_schedule.get_leader(floor_leader_boundary) {
-                Ok(Some(leader)) => leader,
-                Ok(None) => {
-                    tracing::warn!(
-                        "Yellowstone TPU sender missing leader for slot boundary {}",
-                        floor_leader_boundary
-                    );
-                    return Err(SendError {
-                        kind: SendErrorKind::UnknownLeader,
-                        txn: wire_txn,
-                    });
-                }
-                Err(_) => {
-                    return Err(SendError {
-                        kind: SendErrorKind::ManagedLeaderScheduleDisconnected,
-                        txn: wire_txn,
-                    });
-                }
-            }
         };
-
-        if let Err(kind) = self.send_txn_to_leader(sig, &wire_txn, target_leader, None) {
+        if leaders.is_empty() {
+            tracing::warn!(
+                "Yellowstone TPU sender missing leaders for slot {} fanout {}",
+                current_slot,
+                self.send_fanout_slots
+            );
             return Err(SendError {
-                kind,
+                kind: SendErrorKind::UnknownLeader,
                 txn: wire_txn,
             });
         }
 
-        Ok(())
+        let mut sent_addr = None;
+        let mut first_error = None;
+        let mut sent_any = false;
+        let dedupe_by_addr = leaders.len() > 1;
+        for leader in leaders {
+            let sent_addr = dedupe_by_addr.then_some(&mut sent_addr);
+            match self.send_txn_to_leader(sig, &wire_txn, leader, sent_addr) {
+                Ok(()) => sent_any = true,
+                Err(kind) => {
+                    if first_error.is_none() {
+                        first_error = Some(kind);
+                    }
+                }
+            }
+        }
+
+        if sent_any {
+            Ok(())
+        } else {
+            Err(SendError {
+                kind: first_error.unwrap_or(SendErrorKind::UnknownLeader),
+                txn: wire_txn,
+            })
+        }
     }
 
     /// Enqueues a transaction to the TPU of the current leader without allocating an async future.
@@ -482,6 +429,11 @@ async fn create_yellowstone_tpu_sender_with_clients(
         managed_schedule: managed_leader_schedule.clone(),
     };
     let tpu_port_kind = config.tpu.tpu_port;
+    let send_fanout_slots = config
+        .tpu
+        .send_fanout_slots
+        .get()
+        .min(MAX_SEND_FANOUT_SLOTS);
     let tpu_info_service: Arc<dyn crate::core::LeaderTpuInfoService + Send + Sync> =
         Arc::new(tpu_info_service);
     let base_tpu_sender = create_base_tpu_client(
@@ -504,6 +456,7 @@ async fn create_yellowstone_tpu_sender_with_clients(
         leader_schedule: managed_leader_schedule,
         leader_tpu_info: Arc::clone(&tpu_info_service),
         tpu_port_kind,
+        send_fanout_slots,
     };
 
     let handles = vec![
@@ -601,6 +554,7 @@ mod tests {
         crate::core::LeaderTpuInfoService,
         std::{
             collections::HashMap,
+            num::NonZeroU64,
             sync::{
                 Arc,
                 atomic::{AtomicUsize, Ordering},
@@ -644,7 +598,7 @@ mod tests {
         leaders: Vec<Pubkey>,
         tpu_info: Arc<CountingTpuInfo>,
     ) -> (YellowstoneTpuSender, mpsc::Receiver<TpuSenderTxn>) {
-        test_sender_with_capacity(slot, leaders, tpu_info, 8)
+        test_sender_with_capacity_and_config(slot, leaders, tpu_info, 8, TpuSenderConfig::default())
     }
 
     fn test_sender_with_capacity(
@@ -653,6 +607,22 @@ mod tests {
         tpu_info: Arc<CountingTpuInfo>,
         capacity: usize,
     ) -> (YellowstoneTpuSender, mpsc::Receiver<TpuSenderTxn>) {
+        test_sender_with_capacity_and_config(
+            slot,
+            leaders,
+            tpu_info,
+            capacity,
+            TpuSenderConfig::default(),
+        )
+    }
+
+    fn test_sender_with_capacity_and_config(
+        slot: u64,
+        leaders: Vec<Pubkey>,
+        tpu_info: Arc<CountingTpuInfo>,
+        capacity: usize,
+        config: TpuSenderConfig,
+    ) -> (YellowstoneTpuSender, mpsc::Receiver<TpuSenderTxn>) {
         let (txn_tx, txn_rx) = mpsc::channel(capacity);
         let leader_tpu_info: Arc<dyn LeaderTpuInfoService + Send + Sync> = tpu_info;
         let sender = YellowstoneTpuSender {
@@ -660,7 +630,8 @@ mod tests {
             atomic_slot_tracker: Arc::new(AtomicSlotTracker::new(slot)),
             leader_schedule: ManagedLeaderSchedule::new_for_tests(0, leaders),
             leader_tpu_info,
-            tpu_port_kind: TpuPortKind::Normal,
+            tpu_port_kind: config.tpu_port,
+            send_fanout_slots: config.send_fanout_slots.get().min(MAX_SEND_FANOUT_SLOTS),
         };
         (sender, txn_rx)
     }
@@ -670,8 +641,16 @@ mod tests {
         let current_leader = Pubkey::new_unique();
         let next_leader = Pubkey::new_unique();
         let tpu_info = Arc::new(CountingTpuInfo::new(HashMap::new()));
-        let (sender, mut txn_rx) =
-            test_sender(1, vec![current_leader, next_leader], Arc::clone(&tpu_info));
+        let (sender, mut txn_rx) = test_sender_with_capacity_and_config(
+            1,
+            vec![current_leader, next_leader],
+            Arc::clone(&tpu_info),
+            8,
+            TpuSenderConfig {
+                send_fanout_slots: NonZeroU64::new(1).expect("non-zero fanout"),
+                ..TpuSenderConfig::default()
+            },
+        );
 
         sender
             .send_txn(Signature::default(), vec![1_u8, 2, 3])
@@ -689,8 +668,16 @@ mod tests {
         let current_leader = Pubkey::new_unique();
         let next_leader = Pubkey::new_unique();
         let tpu_info = Arc::new(CountingTpuInfo::new(HashMap::new()));
-        let (sender, mut txn_rx) =
-            test_sender(1, vec![current_leader, next_leader], Arc::clone(&tpu_info));
+        let (sender, mut txn_rx) = test_sender_with_capacity_and_config(
+            1,
+            vec![current_leader, next_leader],
+            Arc::clone(&tpu_info),
+            8,
+            TpuSenderConfig {
+                send_fanout_slots: NonZeroU64::new(1).expect("non-zero fanout"),
+                ..TpuSenderConfig::default()
+            },
+        );
 
         sender
             .try_send_txn(Signature::default(), vec![1_u8, 2, 3])
@@ -745,6 +732,35 @@ mod tests {
 
         let txn = txn_rx.try_recv().expect("current leader transaction");
         assert_eq!(txn.remote_peer, current_leader);
+        assert!(txn_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn default_send_fanout_targets_current_and_upcoming_leaders() {
+        let current_leader = Pubkey::new_unique();
+        let next_leader = Pubkey::new_unique();
+        let third_leader = Pubkey::new_unique();
+        let fourth_leader = Pubkey::new_unique();
+        let tpu_info = Arc::new(CountingTpuInfo::new(HashMap::new()));
+        let (sender, mut txn_rx) = test_sender(
+            1,
+            vec![current_leader, next_leader, third_leader, fourth_leader],
+            tpu_info,
+        );
+
+        sender
+            .try_send_txn(Signature::default(), vec![1_u8, 2, 3])
+            .expect("send txn");
+
+        let queued = [
+            txn_rx.try_recv().expect("current leader transaction"),
+            txn_rx.try_recv().expect("next leader transaction"),
+            txn_rx.try_recv().expect("third leader transaction"),
+        ];
+        assert_eq!(
+            queued.map(|txn| txn.remote_peer),
+            [current_leader, next_leader, third_leader,]
+        );
         assert!(txn_rx.try_recv().is_err());
     }
 }

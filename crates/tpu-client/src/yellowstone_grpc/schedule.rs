@@ -48,10 +48,9 @@ impl UpcomingLeaderPredictor for YellowstoneUpcomingLeader {
             }
         };
         let reminder = slot % 4;
-
-        let next_leader_boundary = slot + (4 - reminder);
+        let current_leader_boundary = slot.saturating_sub(reminder);
         let mut leaders = Vec::with_capacity(n);
-        for leader_slot in (0..n).map(|i| next_leader_boundary + (i * 4) as u64) {
+        for leader_slot in (0..n).map(|i| current_leader_boundary + (i * 4) as u64) {
             match self.managed_schedule.get_leader(leader_slot) {
                 Ok(Some(leader)) => leaders.push(leader),
                 Ok(None) => {
@@ -70,5 +69,32 @@ impl UpcomingLeaderPredictor for YellowstoneUpcomingLeader {
             }
         }
         leaders
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use {
+        super::*,
+        crate::{rpc::schedule::ManagedLeaderSchedule, slot::AtomicSlotTracker},
+        std::sync::Arc,
+    };
+
+    #[test]
+    fn prediction_includes_current_leader_first() {
+        let current_leader = Pubkey::new_unique();
+        let next_leader = Pubkey::new_unique();
+        let third_leader = Pubkey::new_unique();
+        let predictor = YellowstoneUpcomingLeader {
+            slot_tracker: Arc::new(AtomicSlotTracker::new(1)),
+            managed_schedule: ManagedLeaderSchedule::new_for_tests(
+                0,
+                vec![current_leader, next_leader, third_leader],
+            ),
+        };
+
+        let leaders = predictor.try_predict_next_n_leaders(2);
+
+        assert_eq!(leaders, vec![current_leader, next_leader]);
     }
 }

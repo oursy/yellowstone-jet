@@ -5,6 +5,7 @@ use {
     solana_clock::DEFAULT_SLOTS_PER_EPOCH,
     solana_pubkey::Pubkey,
     std::{
+        collections::HashSet,
         str::FromStr,
         sync::{Arc, RwLock, atomic::AtomicBool},
     },
@@ -238,6 +239,38 @@ impl ManagedLeaderSchedule {
             return Err(PoisonError);
         }
         Ok(slots.map(|slot| Self::get_leader_from_schedules(&schedules, slot)))
+    }
+
+    ///
+    /// Gets unique leaders for the current slot and upcoming slots in one schedule read.
+    ///
+    /// `fanout_slots` follows Solana TPU client's semantics: the range starts at
+    /// `current_slot` and advances by the four-slot leader stride until the window ends.
+    ///
+    pub fn get_unique_leaders_for_slot_fanout(
+        &self,
+        current_slot: u64,
+        fanout_slots: u64,
+    ) -> Result<Vec<Pubkey>, PoisonError> {
+        let Ok(schedules) = self.inner.read() else {
+            return Err(PoisonError);
+        };
+        if schedules.fail.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(PoisonError);
+        }
+
+        let leader_count = fanout_slots.div_ceil(4) as usize;
+        let mut leaders = Vec::with_capacity(leader_count);
+        let mut seen = HashSet::with_capacity(leader_count);
+        let end_slot = current_slot.saturating_add(fanout_slots);
+        for leader_slot in (current_slot..end_slot).step_by(4) {
+            if let Some(leader) = Self::get_leader_from_schedules(&schedules, leader_slot)
+                && seen.insert(leader)
+            {
+                leaders.push(leader);
+            }
+        }
+        Ok(leaders)
     }
 }
 

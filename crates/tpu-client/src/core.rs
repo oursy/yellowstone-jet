@@ -2806,7 +2806,7 @@ where
 
     fn try_predict_upcoming_leaders_if_necessary(&mut self) {
         // THIS BRANCH IS HIGHLY LIKELY TO BE TRUE
-        if self.next_leader_prediction_deadline.elapsed() == Duration::ZERO {
+        if Instant::now() < self.next_leader_prediction_deadline {
             return;
         }
 
@@ -2907,9 +2907,22 @@ where
 
     pub async fn run(mut self) {
         let mut sleep_timer: Option<Pin<Box<Sleep>>> = None;
+        let mut leader_prediction_timer: Option<Pin<Box<Sleep>>> = None;
         loop {
             self.do_eviction_if_required();
             self.try_predict_upcoming_leaders_if_necessary();
+
+            if self.config.leader_prediction_lookahead.is_some() {
+                let deadline = self.next_leader_prediction_deadline;
+                if let Some(timer) = leader_prediction_timer.as_mut() {
+                    timer.as_mut().reset(deadline.into());
+                } else {
+                    leader_prediction_timer =
+                        Some(Box::pin(tokio::time::sleep_until(deadline.into())));
+                }
+            } else {
+                leader_prediction_timer = None;
+            }
 
             let next_connection_expiration = self.next_orphan_connection_expiration();
             match next_connection_expiration {
@@ -2942,6 +2955,11 @@ where
                 }
                 _ = async { sleep_timer.as_mut().unwrap().await }, if sleep_timer.is_some() => {
                     self.try_evict_orphan_connections();
+                    sleep_timer = None;
+                }
+
+                _ = async { leader_prediction_timer.as_mut().unwrap().await }, if leader_prediction_timer.is_some() => {
+                    leader_prediction_timer = None;
                 }
                 // If cnc_rx returns None, we don't care as clients can safely drop cnc sender and the runtime should keep function.
                 Some(command) = self.cnc_rx.recv() => {
@@ -3524,13 +3542,21 @@ mod test {
             core::{
                 IgnorantLeaderPredictor, LeaderTpuInfoService, Nothing, StakeBasedEvictionStrategy,
                 TpuSenderDriverSpawner, TpuSenderResponse, TpuSenderTxn, TxDropReason,
-                ValidatorStakeInfoService,
+                UpcomingLeaderPredictor, ValidatorStakeInfoService,
             },
         },
         solana_keypair::Keypair,
         solana_pubkey::Pubkey,
         solana_signature::Signature,
-        std::{net::SocketAddr, sync::Arc, time::Duration},
+        std::{
+            net::SocketAddr,
+            num::NonZeroUsize,
+            sync::{
+                Arc,
+                atomic::{AtomicUsize, Ordering},
+            },
+            time::Duration,
+        },
         tokio::{sync::mpsc, time::timeout},
     };
 
@@ -3566,6 +3592,24 @@ mod test {
 
         fn get_quic_tpu_fwd_socket_addr(&self, leader_pubkey: &Pubkey) -> Option<SocketAddr> {
             (*leader_pubkey == self.remote_peer).then_some(self.addr)
+        }
+    }
+
+    #[derive(Default)]
+    struct CountingLeaderPredictor {
+        calls: AtomicUsize,
+    }
+
+    impl CountingLeaderPredictor {
+        fn calls(&self) -> usize {
+            self.calls.load(Ordering::Relaxed)
+        }
+    }
+
+    impl UpcomingLeaderPredictor for CountingLeaderPredictor {
+        fn try_predict_next_n_leaders(&self, _n: usize) -> Vec<Pubkey> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            Vec::new()
         }
     }
 
@@ -3650,6 +3694,45 @@ mod test {
         assert_eq!(dropped_tx.tx_sig, dropped_sig);
         assert_eq!(attempt, 1);
         assert!(dropped.dropped_tx_vec.is_empty());
+
+        drop(session.driver_tx_sink);
+        timeout(Duration::from_secs(1), session.driver_join_handle)
+            .await
+            .expect("driver exits")
+            .expect("driver task");
+    }
+
+    #[tokio::test]
+    async fn driver_predicts_leaders_on_timer_without_incoming_transactions() {
+        let predictor = Arc::new(CountingLeaderPredictor::default());
+        let spawner = TpuSenderDriverSpawner {
+            stake_info_map: Arc::new(EmptyStakeInfo),
+            leader_tpu_info_service: Arc::new(EmptyLeaderTpuInfo),
+            driver_tx_channel_capacity: 1,
+        };
+        let config = TpuSenderConfig {
+            leader_prediction_lookahead: NonZeroUsize::new(1),
+            remote_peer_addr_watch_interval: Duration::from_secs(60),
+            ..Default::default()
+        };
+        let session = spawner.spawn(
+            Keypair::new(),
+            config,
+            Arc::new(StakeBasedEvictionStrategy::default()),
+            predictor.clone(),
+            None::<Nothing>,
+        );
+
+        timeout(Duration::from_secs(2), async {
+            loop {
+                if predictor.calls() >= 2 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("prediction timer should fire again without tx input");
 
         drop(session.driver_tx_sink);
         timeout(Duration::from_secs(1), session.driver_join_handle)

@@ -3,7 +3,12 @@ use {
     serde::{Deserialize, Deserializer, de},
     solana_net_utils::{PortRange, VALIDATOR_PORT_RANGE},
     solana_pubkey::Pubkey,
-    std::{net::SocketAddr, num::NonZeroUsize, ops::Range, time::Duration},
+    std::{
+        net::SocketAddr,
+        num::{NonZeroU64, NonZeroUsize},
+        ops::Range,
+        time::Duration,
+    },
 };
 
 ///
@@ -187,6 +192,19 @@ pub struct TpuSenderConfig {
     pub leader_prediction_lookahead: Option<NonZeroUsize>,
 
     ///
+    /// Number of upcoming slots used to build the leader fanout set on each send.
+    ///
+    /// The send path starts at the current slot and sends to each unique leader in this
+    /// slot window. This mirrors Solana TPU client's fanout strategy while preserving
+    /// Yellowstone slot accuracy.
+    ///
+    #[serde(
+        default = "TpuSenderConfig::default_send_fanout_slots",
+        alias = "fanout_slots"
+    )]
+    pub send_fanout_slots: NonZeroU64,
+
+    ///
     /// The TPU address rewrite map for QUIC connections.
     ///
     #[serde(default)]
@@ -289,6 +307,10 @@ impl TpuSenderConfig {
         Some(DEFAULT_LEADER_PREDICTION_LOOKAHEAD)
     }
 
+    pub const fn default_send_fanout_slots() -> NonZeroU64 {
+        DEFAULT_SEND_FANOUT_SLOTS
+    }
+
     pub const fn default_tpu_port_kind() -> TpuPortKind {
         TpuPortKind::Forwards
     }
@@ -318,6 +340,8 @@ pub const DEFAULT_MAX_SEND_ATTEMPT: NonZeroUsize = NonZeroUsize::new(3).unwrap()
 pub const DEFAULT_REMOTE_PEER_ADDR_WATCH_INTERVAL: Duration = Duration::from_secs(5);
 pub const DEFAULT_TX_SEND_TIMEOUT: Duration = Duration::from_secs(2);
 pub const DEFAULT_LEADER_PREDICTION_LOOKAHEAD: NonZeroUsize = NonZeroUsize::new(4).unwrap();
+pub const DEFAULT_SEND_FANOUT_SLOTS: NonZeroU64 = NonZeroU64::new(12).unwrap();
+pub const MAX_SEND_FANOUT_SLOTS: u64 = 100;
 
 impl Default for TpuSenderConfig {
     fn default() -> Self {
@@ -335,6 +359,7 @@ impl Default for TpuSenderConfig {
             remote_peer_addr_watch_interval: DEFAULT_REMOTE_PEER_ADDR_WATCH_INTERVAL,
             send_timeout: DEFAULT_TX_SEND_TIMEOUT,
             leader_prediction_lookahead: Some(DEFAULT_LEADER_PREDICTION_LOOKAHEAD),
+            send_fanout_slots: DEFAULT_SEND_FANOUT_SLOTS,
             tpu_info_override: Vec::new(),
             orphan_connection_ttl: DEFAULT_UNUSED_CONNECTION_TTL,
             unsafe_allow_arbitrary_txn_size: false,
@@ -346,7 +371,7 @@ impl Default for TpuSenderConfig {
 pub mod test {
     use {
         crate::config::{TpuPortKind, TpuSenderConfig},
-        std::num::NonZeroUsize,
+        std::num::{NonZeroU64, NonZeroUsize},
     };
 
     #[test]
@@ -371,12 +396,14 @@ pub mod test {
         endpoint_count: 3
         send_retry_count: 5
         connection_prediction_lookahead: 7
+        fanout_slots: 8
         tpu_port: normal
         "#;
         let expected = TpuSenderConfig {
             num_endpoints: NonZeroUsize::new(3).unwrap(),
             max_send_attempt: NonZeroUsize::new(5).unwrap(),
             leader_prediction_lookahead: NonZeroUsize::new(7),
+            send_fanout_slots: NonZeroU64::new(8).unwrap(),
             tpu_port: TpuPortKind::Normal,
             ..TpuSenderConfig::default()
         };
