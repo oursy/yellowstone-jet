@@ -5,7 +5,6 @@ use {
     solana_clock::DEFAULT_SLOTS_PER_EPOCH,
     solana_pubkey::Pubkey,
     std::{
-        collections::HashSet,
         str::FromStr,
         sync::{Arc, RwLock, atomic::AtomicBool},
     },
@@ -261,11 +260,10 @@ impl ManagedLeaderSchedule {
 
         let leader_count = fanout_slots.div_ceil(4) as usize;
         let mut leaders = Vec::with_capacity(leader_count);
-        let mut seen = HashSet::with_capacity(leader_count);
         let end_slot = current_slot.saturating_add(fanout_slots);
         for leader_slot in (current_slot..end_slot).step_by(4) {
             if let Some(leader) = Self::get_leader_from_schedules(&schedules, leader_slot)
-                && seen.insert(leader)
+                && !leaders.contains(&leader)
             {
                 leaders.push(leader);
             }
@@ -584,5 +582,16 @@ mod tests {
         assert_eq!(batched[0], managed.get_leader(0).expect("slot 0"));
         assert_eq!(batched[1], managed.get_leader(4).expect("slot 4"));
         assert_eq!(batched, [Some(leader_a), Some(leader_b)]);
+    }
+
+    #[test]
+    fn fanout_leader_lookup_avoids_hash_table_on_send_path() {
+        let source = include_str!("schedule.rs");
+        let hash_set_capacity = format!("{}Set::with_capacity", "Hash");
+
+        assert!(
+            !source.contains(&hash_set_capacity),
+            "leader fanout lookup is on the transaction send path; use bounded linear dedupe instead of allocating a hash table"
+        );
     }
 }
