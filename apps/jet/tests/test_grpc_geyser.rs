@@ -38,7 +38,7 @@ fn create_block_meta(slot: Slot, block_height: Option<u64>) -> SubscribeUpdate {
     SubscribeUpdate {
         update_oneof: Some(UpdateOneof::BlockMeta(SubscribeUpdateBlockMeta {
             slot,
-            blockhash: Hash::new_unique().to_string(),
+            blockhash: Hash::new_from_array([slot as u8; 32]).to_string(),
             rewards: None,
             block_time: None,
             block_height: block_height.map(|h| BlockHeight { block_height: h }),

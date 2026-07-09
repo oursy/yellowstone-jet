@@ -19,9 +19,6 @@ use {
         str::FromStr,
     },
     tokio::{fs, time::Duration},
-    yellowstone_shield_store::{
-        PolicyStoreConfig, PolicyStoreGrpcConfig, PolicyStoreRpcConfig, ShieldStoreCommitmentLevel,
-    },
 };
 
 pub const DEFAULT_TPU_CONNECTION_POOL_SIZE: usize = 1;
@@ -83,7 +80,7 @@ pub struct ConfigJet {
     /// Prometheus Push Gateway
     pub prometheus: Option<PrometheusConfig>,
 
-    /// Shield Program ID (Optional, default to yellowstone-shield-store default)
+    /// Shield Program ID.
     #[serde(default, deserialize_with = "ConfigJet::deserialize_maybe_program_id")]
     pub program_id: Option<Pubkey>,
 
@@ -222,36 +219,6 @@ impl ConfigUpstreamGrpc {
     }
 }
 
-impl From<ConfigUpstream> for PolicyStoreConfig {
-    fn from(config: ConfigUpstream) -> Self {
-        let ConfigUpstream {
-            rpc,
-            grpc: ConfigUpstreamGrpc { endpoint, x_token },
-            ..
-        } = config;
-
-        PolicyStoreConfig {
-            rpc: PolicyStoreRpcConfig { endpoint: rpc },
-            grpc: PolicyStoreGrpcConfig {
-                endpoint,
-                x_token,
-                max_decoding_message_size: Some(100_000_000),
-                commitment: Some(ShieldStoreCommitmentLevel::Confirmed),
-                connect_timeout: Duration::from_secs(60),
-                http2_adaptive_window: true,
-                http2_keep_alive: true,
-                timeout: Duration::from_secs(60),
-                tcp_nodelay: true,
-                http2_keep_alive_interval: None,
-                http2_keep_alive_timeout: None,
-                http2_keep_alive_while_idle: None,
-                initial_connection_window_size: None,
-                initial_stream_window_size: None,
-            },
-        }
-    }
-}
-
 #[derive(Clone, Debug, Deserialize)]
 pub struct ConfigJetGatewayClient {
     /// gRPC service endpoints, only one connection would be used
@@ -339,8 +306,7 @@ pub struct ConfigSendTransactionService {
     #[serde(default)]
     pub relay_only_mode: bool,
 
-    /// Extra forward (transactions would be always sent to these nodes)
-    /// regardless of the transaction yellowstone-shield policies.
+    /// Extra forward (transactions would be always sent to these nodes).
     #[serde(default, deserialize_with = "deser_pubkey_vec")]
     pub extra_fanout: Vec<Pubkey>,
 }

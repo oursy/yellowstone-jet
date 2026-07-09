@@ -25,7 +25,6 @@ use {
         time::Instant,
     },
     tracing::error,
-    yellowstone_shield_store::{CheckError, PolicyStoreTrait},
 };
 
 pub type RootedTransactionsUpdateSignature = (Signature, CommitmentLevel);
@@ -570,25 +569,17 @@ pub struct TransactionFanout {
 enum SendTransactionError {
     #[error("transaction gateway sink is closed")]
     GatewayClosed,
-    #[error(transparent)]
-    ShieldPoliciesNotFound(#[from] CheckError),
 }
 
 pub trait TransactionPolicyStore {
-    fn is_allowed(&self, policies: &[Pubkey], leader: &Pubkey) -> Result<bool, CheckError>;
-}
-
-impl<T: PolicyStoreTrait> TransactionPolicyStore for T {
-    fn is_allowed(&self, policies: &[Pubkey], leader: &Pubkey) -> Result<bool, CheckError> {
-        self.snapshot().is_allowed(policies, leader)
-    }
+    fn is_allowed(&self, policies: &[Pubkey], leader: &Pubkey) -> bool;
 }
 
 pub struct AlwaysAllowTransactionPolicyStore;
 
 impl TransactionPolicyStore for AlwaysAllowTransactionPolicyStore {
-    fn is_allowed(&self, _policies: &[Pubkey], _leader: &Pubkey) -> Result<bool, CheckError> {
-        Ok(true)
+    fn is_allowed(&self, _policies: &[Pubkey], _leader: &Pubkey) -> bool {
+        true
     }
 }
 
@@ -735,9 +726,6 @@ impl TransactionFanout {
             Err(SendTransactionError::GatewayClosed) => {
                 tracing::error!("gateway sender is closed");
             }
-            Err(SendTransactionError::ShieldPoliciesNotFound(_)) => {
-                metrics::shield_policies_not_found_inc();
-            }
         }
     }
 
@@ -774,7 +762,7 @@ impl TransactionFanout {
             sent_mask.resize(next_leaders.len(), false);
             let txn_wire = tx.wire_transaction.clone();
             for (i, dest) in next_leaders.iter().enumerate() {
-                if !policy_store_service.is_allowed(&tx.policies, dest)? {
+                if !policy_store_service.is_allowed(&tx.policies, dest) {
                     // Report skip to Lewis
                     if let Some(handler) = &lewis_handler {
                         handler.handle_skip(tx.signature, *dest, current_slot, &tx.policies);

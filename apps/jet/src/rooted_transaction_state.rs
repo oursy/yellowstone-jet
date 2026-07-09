@@ -136,6 +136,10 @@ pub const fn should_retain_finalized_slot(
 mod tests {
     use super::*;
 
+    const fn test_hash(seed: u8) -> solana_hash::Hash {
+        solana_hash::Hash::new_from_array([seed; 32])
+    }
+
     #[test]
     fn test_max_recent_blockhashes() {
         assert_eq!(MAX_RECENT_BLOCKHASHES, 300);
@@ -159,7 +163,7 @@ mod tests {
             machine.process_event(RootedTxEvent::BlockMetaUpdate(BlockMetaWithCommitment {
                 slot: 100,
                 block_height: 1000,
-                block_hash: solana_hash::Hash::new_unique(),
+                block_hash: test_hash(1),
                 commitment: CommitmentLevel::Finalized,
             }));
         assert_eq!(effects.len(), 1);
@@ -179,7 +183,7 @@ mod tests {
         machine.process_event(RootedTxEvent::BlockMetaUpdate(BlockMetaWithCommitment {
             slot: 200,
             block_height: 1300,
-            block_hash: solana_hash::Hash::new_unique(),
+            block_hash: test_hash(2),
             commitment: CommitmentLevel::Finalized,
         }));
 
@@ -189,7 +193,7 @@ mod tests {
         machine.process_event(RootedTxEvent::BlockMetaUpdate(BlockMetaWithCommitment {
             slot: 300,
             block_height: 1400,
-            block_hash: solana_hash::Hash::new_unique(),
+            block_hash: test_hash(3),
             commitment: CommitmentLevel::Finalized,
         }));
 

@@ -17,7 +17,6 @@ use {
         AlwaysAllowTransactionPolicyStore, FanoutConfig, QuicGatewayBidi, SendTransactionRequest,
         TransactionFanout, TransactionPolicyStore, UpcomingLeaderSchedule,
     },
-    yellowstone_shield_store::CheckError,
 };
 
 pub fn create_send_transaction_request(hash: Hash, max_resent: usize) -> SendTransactionRequest {
@@ -47,6 +46,10 @@ pub fn create_send_transaction_request(hash: Hash, max_resent: usize) -> SendTra
         transaction: tx,
         policies: vec![],
     }
+}
+
+const fn test_hash(seed: u8) -> Hash {
+    Hash::new_from_array([seed; 32])
 }
 
 #[derive(Default, Clone)]
@@ -107,7 +110,7 @@ async fn it_should_fanout_three_times() {
         fanout.run().await;
     });
 
-    let tx = create_send_transaction_request(Hash::new_unique(), 0);
+    let tx = create_send_transaction_request(test_hash(1), 0);
     let tx = Arc::new(tx);
     sink.send(Arc::clone(&tx)).unwrap();
 
@@ -146,8 +149,8 @@ async fn it_should_apply_shield_policies() {
     }
 
     impl TransactionPolicyStore for MyPolicy {
-        fn is_allowed(&self, _policies: &[Pubkey], leader: &Pubkey) -> Result<bool, CheckError> {
-            Ok(!self.blacklist.contains(leader))
+        fn is_allowed(&self, _policies: &[Pubkey], leader: &Pubkey) -> bool {
+            !self.blacklist.contains(leader)
         }
     }
     let policy = MyPolicy {
@@ -168,7 +171,7 @@ async fn it_should_apply_shield_policies() {
         fanout.run().await;
     });
 
-    let tx = create_send_transaction_request(Hash::new_unique(), 0);
+    let tx = create_send_transaction_request(test_hash(2), 0);
     let tx = Arc::new(tx);
     sink.send(Arc::clone(&tx)).unwrap();
     let actual_tx = gateway_rx.recv().await.unwrap();
@@ -213,7 +216,7 @@ async fn it_should_support_extra_fanout() {
         fanout.run().await;
     });
 
-    let tx = create_send_transaction_request(Hash::new_unique(), 0);
+    let tx = create_send_transaction_request(test_hash(3), 0);
     let tx = Arc::new(tx);
     sink.send(Arc::clone(&tx)).unwrap();
 

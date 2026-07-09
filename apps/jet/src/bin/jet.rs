@@ -52,12 +52,11 @@ use {
         transaction_handler::TransactionHandler,
         transactions::{
             AlwaysAllowTransactionPolicyStore, FanoutConfig, GrpcRootedTxReceiver, QuicGatewayBidi,
-            TransactionFanout, TransactionNoRetryScheduler, TransactionPolicyStore,
-            TransactionRetryScheduler, TransactionRetrySchedulerConfig,
+            TransactionFanout, TransactionNoRetryScheduler, TransactionRetryScheduler,
+            TransactionRetrySchedulerConfig,
         },
         util::{WaitShutdown, prom::inject_job_label},
     },
-    yellowstone_shield_store::PolicyStore,
 };
 
 #[cfg(not(target_env = "msvc"))]
@@ -284,20 +283,7 @@ async fn run_jet(
     )
     .await;
 
-    let shield_policy_store = if config
-        .features
-        .is_feature_enabled(yellowstone_jet::proto::jet::Feature::YellowstoneShield)
-    {
-        let policy_store_config = config.upstream.clone().into();
-        let policy_store = PolicyStore::build()
-            .config(policy_store_config)
-            .run()
-            .await?;
-
-        Arc::new(policy_store) as Arc<dyn TransactionPolicyStore + Send + Sync>
-    } else {
-        Arc::new(AlwaysAllowTransactionPolicyStore)
-    };
+    let shield_policy_store = Arc::new(AlwaysAllowTransactionPolicyStore);
 
     let (geyser, geyser_handle) = GeyserSubscriber::new(
         config.upstream.grpc.clone(),

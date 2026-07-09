@@ -14,7 +14,6 @@ Implements the Solana QUIC protocol for sending transactions.
 - Simulation and transaction sanitization support via external RPC
 - Prometheus metrics
 - Dynamic key loading via getIdentity/setIdentity
-- Support for shield policies to determine eligible leaders for transaction forwarding
 - Support for connecting to Triton's Cascade delivery network
 
 ## Building
@@ -66,11 +65,11 @@ POST /api/v1/transactions
 
 ### Optional headers
 
-These headers provide per-request overrides for retry and policy behavior.
+These headers provide per-request transaction metadata.
 
 | Header | Values | Description |
 |--------|--------|-------------|
-| `solana-forwardingpolicies` | comma-separated pubkeys | Restrict forwarding to leaders allowed by these policies |
+| `solana-forwardingpolicies` | comma-separated pubkeys | Forwarding policy metadata, preserved for compatible peers |
 
 ### Content types
 
@@ -87,7 +86,7 @@ curl -X POST /api/v1/transactions \
   -H 'Content-Type: application/octet-stream' \
   --data-binary @transaction.bin
 
-# Raw bytes with retry in query and policy override in header, return signature
+# Raw bytes with retry in query and policy metadata in header, return signature
 curl -X POST '/api/v1/transactions?response=signature&max_retries=3' \
   -H 'Content-Type: application/octet-stream' \
   -H 'solana-forwardingpolicies: 11111111111111111111111111111111' \

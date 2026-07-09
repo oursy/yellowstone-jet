@@ -53,6 +53,10 @@ pub fn create_send_transaction_request(hash: Hash, max_resent: usize) -> SendTra
     }
 }
 
+const fn test_hash(seed: u8) -> Hash {
+    Hash::new_from_array([seed; 32])
+}
+
 #[derive(Default, Clone)]
 pub struct FakeLeaderSchedule {
     share: Arc<StdRwLock<Vec<Pubkey>>>,
@@ -96,7 +100,7 @@ async fn it_should_retry_transaction_three_time() {
         Some(dlq_tx),
     );
 
-    let blockhash = Hash::new_unique();
+    let blockhash = test_hash(1);
     blockheight_service.increase_block_height(blockhash);
     let tx = create_send_transaction_request(blockhash, 3);
     let tx = Arc::new(tx);
@@ -143,8 +147,8 @@ async fn it_should_not_attempt_invalid_transaction() {
         Some(dlq_tx),
     );
 
-    let blockhash1 = Hash::new_unique();
-    let blockhash2 = Hash::new_unique();
+    let blockhash1 = test_hash(2);
+    let blockhash2 = test_hash(3);
     blockheight_service.increase_block_height(blockhash1);
     blockheight_service.increase_block_height(blockhash2);
     let tx = create_send_transaction_request(blockhash1, 3);
