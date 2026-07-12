@@ -107,8 +107,8 @@ solana-transaction = "4"
 solana-transaction-error = "3"
 
 # Yellowstone
-yellowstone-grpc-proto = { git = "https://github.com/rpcpool/yellowstone-grpc.git", rev = "7b43d90" }
-yellowstone-grpc-client = { git = "https://github.com/rpcpool/yellowstone-grpc.git", rev = "7b43d90" }
+yellowstone-grpc-proto = { git = "https://github.com/rpcpool/yellowstone-grpc.git", rev = "50b6b89" }
+yellowstone-grpc-client = { git = "https://github.com/rpcpool/yellowstone-grpc.git", rev = "50b6b89" }
 yellowstone-jet-tpu-client = { path = "crates/tpu-client", version = "0.4.0" }
 
 [workspace.lints.clippy]
