@@ -42,7 +42,6 @@ use {
     crate::config::{TpuOverrideInfo, TpuPortKind, TpuSenderConfig},
     bytes::Bytes,
     derive_more::Display,
-    futures::task::AtomicWaker,
     quinn::{
         ClientConfig, Connection, ConnectionError, Endpoint, IdleTimeout, TransportConfig, VarInt,
         WriteError, crypto::rustls::QuicClientConfig,
@@ -60,8 +59,10 @@ use {
         net::{IpAddr, Ipv4Addr, SocketAddr},
         num::NonZeroUsize,
         pin::Pin,
-        sync::{Arc, Mutex as StdMutex, atomic::AtomicBool},
-        task::Poll,
+        sync::{
+            Arc, Mutex as StdMutex,
+            atomic::{AtomicBool, Ordering},
+        },
         time::{Duration, Instant},
     },
     tokio::{
@@ -69,6 +70,7 @@ use {
         sync::{
             Barrier, Notify,
             mpsc::{self},
+            oneshot,
         },
         task::{self, Id, JoinError, JoinHandle, JoinSet},
         time::{Sleep, interval},
@@ -129,19 +131,40 @@ struct ConnectingMeta {
 ///
 struct UpdateIdentityCommand {
     new_identity: Keypair,
-    callback: Arc<UpdateIdentityInner>,
+    callback: oneshot::Sender<()>,
 }
 
 struct MultiStepIdentitySynchronizationCommand {
     new_identity: Keypair,
     barrier: Arc<Barrier>,
+    arrived: oneshot::Sender<()>,
+    permit: IdentityUpdatePermit,
+}
+
+struct IdentityUpdatePermit {
+    in_flight: Arc<AtomicBool>,
+}
+
+impl IdentityUpdatePermit {
+    fn try_acquire(in_flight: Arc<AtomicBool>) -> Result<Self, UpdateIdentityError> {
+        in_flight
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| UpdateIdentityError::InProgress)?;
+        Ok(Self { in_flight })
+    }
+}
+
+impl Drop for IdentityUpdatePermit {
+    fn drop(&mut self) {
+        self.in_flight.store(false, Ordering::Release);
+    }
 }
 
 ///
 /// Command to control driver behavior.
 ///
 enum DriverCommand {
-    UpdateIdenttiy(UpdateIdentityCommand),
+    UpdateIdentity(UpdateIdentityCommand),
     MultiStepIdentitySynchronization(MultiStepIdentitySynchronizationCommand),
 }
 
@@ -2718,16 +2741,13 @@ where
 
     async fn handle_cnc(&mut self, command: DriverCommand) {
         match command {
-            DriverCommand::UpdateIdenttiy(cmd) => {
+            DriverCommand::UpdateIdentity(cmd) => {
                 let UpdateIdentityCommand {
                     new_identity,
                     callback,
                 } = cmd;
                 let fake_barrier = async {
-                    callback
-                        .set
-                        .store(true, std::sync::atomic::Ordering::SeqCst);
-                    callback.waker.wake();
+                    let _ = callback.send(());
                 };
                 self.update_identity(new_identity, fake_barrier).await;
             }
@@ -2737,8 +2757,14 @@ where
                 let MultiStepIdentitySynchronizationCommand {
                     new_identity,
                     barrier,
+                    arrived,
+                    permit,
                 } = multi_step_identity_synchronization_command;
-                let barrier_fut = async {
+                let barrier_fut = async move {
+                    // Once accepted, this command is one of the barrier's fixed participants.
+                    // Receiver cancellation must not change that cardinality.
+                    let _permit = permit;
+                    let _ = arrived.send(());
                     barrier.wait().await;
                 };
                 self.update_identity(new_identity, barrier_fut).await;
@@ -3318,8 +3344,6 @@ impl TpuSenderDriverSpawner {
     where
         CB: TpuSenderResponseCallback,
     {
-        #[cfg(feature = "intg-testing")]
-        let config = config;
         #[cfg(not(feature = "intg-testing"))]
         let mut config = config;
         if config.unsafe_allow_arbitrary_txn_size {
@@ -3414,9 +3438,7 @@ impl TpuSenderDriverSpawner {
 
         TpuSenderSessionContext {
             driver_tx_sink: tx_inlet,
-            identity_updater: TpuSenderIdentityUpdater {
-                cnc_tx: driver_cnc_tx,
-            },
+            identity_updater: TpuSenderIdentityUpdater::new(driver_cnc_tx),
             driver_join_handle: jh,
         }
     }
@@ -3430,101 +3452,121 @@ pub struct TpuSenderIdentityUpdater {
     /// Command-and-control channel to send command to the QUIC driver
     ///  
     cnc_tx: mpsc::Sender<DriverCommand>,
+    identity_update_in_flight: Arc<AtomicBool>,
 }
 
-///
-/// All the updater API is set a "mut" concurrent identity update.
-///
 impl TpuSenderIdentityUpdater {
+    fn new(cnc_tx: mpsc::Sender<DriverCommand>) -> Self {
+        Self {
+            cnc_tx,
+            identity_update_in_flight: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
     ///
     /// Changes the configured identity in the QUIC driver
     ///
-    pub async fn update_identity(&mut self, identity: Keypair) {
-        let shared = UpdateIdentityInner {
-            set: AtomicBool::new(false),
-            waker: AtomicWaker::new(),
-        };
-        let shared = Arc::new(shared);
+    /// # Errors
+    ///
+    /// Returns [`UpdateIdentityError::RuntimeClosed`] if the driver closes before accepting or
+    /// confirming the identity update, or [`UpdateIdentityError::InProgress`] while a prior
+    /// barrier update is still paused.
+    ///
+    pub async fn update_identity(&mut self, identity: Keypair) -> Result<(), UpdateIdentityError> {
+        if self.identity_update_in_flight.load(Ordering::Acquire) {
+            return Err(UpdateIdentityError::InProgress);
+        }
+
+        let (callback, completed) = oneshot::channel();
         let cmd = UpdateIdentityCommand {
             new_identity: identity,
-            callback: Arc::clone(&shared),
+            callback,
         };
         self.cnc_tx
-            .send(DriverCommand::UpdateIdenttiy(cmd))
+            .send(DriverCommand::UpdateIdentity(cmd))
             .await
-            .expect("disconnected");
-        let update_identity = UpdateIdentity {
-            inner: shared,
+            .map_err(|_| UpdateIdentityError::RuntimeClosed)?;
+        UpdateIdentity {
+            completed,
             _this: self,
-        };
-        update_identity.await
+        }
+        .await
     }
 
     ///
     /// Changes the configured identity in the QUIC driver,
     ///
-    /// waiting on the provided barrier before resuming driver operations.
+    /// waiting on the provided barrier before resuming driver operations. This method returns
+    /// after the driver has installed the new identity and reached the barrier.
+    ///
+    /// Only one identity update may be in flight for this driver. After this method returns
+    /// successfully, the caller must ensure every barrier participant reaches the same barrier
+    /// before issuing another identity update. Dropping the coordinating task does not cancel an
+    /// accepted barrier command.
     ///
     /// # Parameters
     ///
     /// - `identity`: The new identity to set in the driver.
     /// - `barrier`: An `Arc<Barrier>` that the driver will wait on before resuming operations.
     ///
+    /// # Errors
+    ///
+    /// Returns [`UpdateIdentityError::RuntimeClosed`] if the driver closes before reaching the
+    /// barrier, or [`UpdateIdentityError::InProgress`] if another barrier update is already
+    /// paused.
+    ///
     pub async fn update_identity_with_confirmation_barrier(
         &self,
         identity: Keypair,
         barrier: Arc<Barrier>,
-    ) {
+    ) -> Result<(), UpdateIdentityError> {
+        let permit =
+            IdentityUpdatePermit::try_acquire(Arc::clone(&self.identity_update_in_flight))?;
+        let (arrived, driver_arrived) = oneshot::channel();
         let cmd = MultiStepIdentitySynchronizationCommand {
             new_identity: identity,
             barrier,
+            arrived,
+            permit,
         };
         self.cnc_tx
             .send(DriverCommand::MultiStepIdentitySynchronization(cmd))
             .await
-            .expect("disconnected");
+            .map_err(|_| UpdateIdentityError::RuntimeClosed)?;
+        driver_arrived
+            .await
+            .map_err(|_| UpdateIdentityError::RuntimeClosed)
     }
 }
 
-///
-/// The shared state used to notify the completion of the identity update.
-/// See [`UpdateIdentity`] for more details.
-struct UpdateIdentityInner {
-    set: AtomicBool,
-    waker: AtomicWaker,
-}
-
-///
-/// Future that waits for the identity update to complete.
-/// This future is used to ensure that the identity update is completed before proceeding.
-///
+/// Future that waits for an accepted identity update to be installed by the driver.
 pub struct UpdateIdentity<'a> {
-    inner: Arc<UpdateIdentityInner>,
-    _this: &'a TpuSenderIdentityUpdater, /* phantom data to prevent two threads from updating the identity at the same time */
+    completed: oneshot::Receiver<()>,
+    _this: &'a TpuSenderIdentityUpdater,
 }
 
 impl Future for UpdateIdentity<'_> {
-    type Output = ();
+    type Output = Result<(), UpdateIdentityError>;
 
     fn poll(
-        self: std::pin::Pin<&mut Self>,
+        self: Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Self::Output> {
-        // quick check to avoid registration if already done.
-        if self.inner.set.load(std::sync::atomic::Ordering::Relaxed) {
-            return Poll::Ready(());
-        }
-
-        self.inner.waker.register(cx.waker());
-
-        // Need to check condition **after** `register` to avoid a race
-        // condition that would result in lost notifications.
-        if self.inner.set.load(std::sync::atomic::Ordering::Relaxed) {
-            Poll::Ready(())
-        } else {
-            Poll::Pending
-        }
+        let this = self.get_mut();
+        Future::poll(Pin::new(&mut this.completed), cx)
+            .map(|result| result.map_err(|_| UpdateIdentityError::RuntimeClosed))
     }
+}
+
+/// Error returned when the TPU sender cannot complete an identity update.
+#[derive(Debug, thiserror::Error)]
+pub enum UpdateIdentityError {
+    /// The TPU sender runtime closed before the update completed.
+    #[error("tpu sender runtime closed")]
+    RuntimeClosed,
+    /// A barrier-based identity update is still waiting to be released.
+    #[error("another identity update is still in progress")]
+    InProgress,
 }
 
 pub const fn module_path_for_test() -> &'static str {
@@ -3536,6 +3578,7 @@ mod test {
     use {
         super::{
             DriverCommand, StakeSortedPeerSet, TpuSenderIdentityUpdater, UpdateIdentityCommand,
+            UpdateIdentityError,
         },
         crate::{
             config::TpuSenderConfig,
@@ -3742,32 +3785,243 @@ mod test {
     }
 
     #[tokio::test]
-    async fn test_update_identity_fut() {
+    async fn update_identity_completes_after_driver_confirmation() {
         let (cnc_tx, mut cnc_rx) = mpsc::channel(10);
-        let mut updater = TpuSenderIdentityUpdater { cnc_tx };
+        let mut updater = TpuSenderIdentityUpdater::new(cnc_tx);
+        let identity = Keypair::new();
+        let update = updater.update_identity(identity.insecure_clone());
+        tokio::pin!(update);
 
-        let jh = tokio::spawn(async move {
-            let DriverCommand::UpdateIdenttiy(UpdateIdentityCommand {
-                new_identity,
-                callback,
-            }) = cnc_rx.recv().await.unwrap()
-            else {
-                panic!("Expected UpdateIdenttiy command");
-            };
-            tokio::time::sleep(Duration::from_secs(2)).await;
-            // This can be relaxed because `wake` hides `Released` memory barrier.
-            callback
-                .set
-                .store(true, std::sync::atomic::Ordering::Relaxed);
-            callback.waker.wake();
-            new_identity
+        assert!(
+            futures::poll!(&mut update).is_pending(),
+            "identity update must wait for driver confirmation"
+        );
+        let DriverCommand::UpdateIdentity(UpdateIdentityCommand {
+            new_identity,
+            callback,
+        }) = cnc_rx.try_recv().expect("identity update command")
+        else {
+            panic!("Expected UpdateIdentity command");
+        };
+        assert_eq!(new_identity, identity);
+        assert!(
+            futures::poll!(&mut update).is_pending(),
+            "identity update must remain pending before confirmation"
+        );
+
+        callback.send(()).expect("identity update receiver");
+        update.await.expect("update identity");
+    }
+
+    #[tokio::test]
+    async fn update_identity_returns_error_when_command_channel_is_closed() {
+        let (cnc_tx, cnc_rx) = mpsc::channel(1);
+        drop(cnc_rx);
+        let mut updater = TpuSenderIdentityUpdater::new(cnc_tx);
+
+        let result = updater.update_identity(Keypair::new()).await;
+
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn update_identity_returns_error_when_queued_command_is_dropped() {
+        let (cnc_tx, cnc_rx) = mpsc::channel(1);
+        let mut updater = TpuSenderIdentityUpdater::new(cnc_tx);
+        let update = updater.update_identity(Keypair::new());
+        tokio::pin!(update);
+
+        assert!(
+            futures::poll!(&mut update).is_pending(),
+            "identity update should wait after its command is queued"
+        );
+        drop(cnc_rx);
+
+        assert!(update.await.is_err());
+    }
+
+    #[tokio::test]
+    async fn update_identity_returns_error_when_driver_drops_inflight_command() {
+        let (cnc_tx, mut cnc_rx) = mpsc::channel(1);
+        let mut updater = TpuSenderIdentityUpdater::new(cnc_tx);
+        let driver = tokio::spawn(async move {
+            let command = cnc_rx.recv().await.expect("identity update command");
+            drop(command);
         });
 
-        let identity = Keypair::new();
-        updater.update_identity(identity.insecure_clone()).await;
+        let result = timeout(
+            Duration::from_secs(1),
+            updater.update_identity(Keypair::new()),
+        )
+        .await
+        .expect("identity update should be woken when command is dropped");
 
-        let actual = jh.await.unwrap();
-        assert_eq!(actual, identity)
+        assert!(result.is_err());
+        driver.await.expect("mock driver");
+    }
+
+    #[tokio::test]
+    async fn barrier_identity_update_returns_error_when_command_channel_is_closed() {
+        let (cnc_tx, cnc_rx) = mpsc::channel(1);
+        drop(cnc_rx);
+        let updater = TpuSenderIdentityUpdater::new(cnc_tx);
+
+        let result = updater
+            .update_identity_with_confirmation_barrier(
+                Keypair::new(),
+                Arc::new(tokio::sync::Barrier::new(1)),
+            )
+            .await;
+
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn barrier_identity_update_waits_until_driver_arrives() {
+        let (cnc_tx, mut cnc_rx) = mpsc::channel(1);
+        let updater = TpuSenderIdentityUpdater::new(cnc_tx);
+        let update = updater.update_identity_with_confirmation_barrier(
+            Keypair::new(),
+            Arc::new(tokio::sync::Barrier::new(1)),
+        );
+        tokio::pin!(update);
+
+        assert!(
+            futures::poll!(&mut update).is_pending(),
+            "barrier update should wait for the driver"
+        );
+        let DriverCommand::MultiStepIdentitySynchronization(command) =
+            cnc_rx.try_recv().expect("barrier identity command")
+        else {
+            panic!("Expected MultiStepIdentitySynchronization command");
+        };
+        assert!(
+            futures::poll!(&mut update).is_pending(),
+            "barrier update should remain pending before driver arrival"
+        );
+
+        command.arrived.send(()).expect("barrier update receiver");
+        update.await.expect("barrier identity update");
+    }
+
+    #[tokio::test]
+    async fn barrier_identity_update_returns_error_when_queued_command_is_dropped() {
+        let (cnc_tx, cnc_rx) = mpsc::channel(1);
+        let updater = TpuSenderIdentityUpdater::new(cnc_tx);
+        let update = updater.update_identity_with_confirmation_barrier(
+            Keypair::new(),
+            Arc::new(tokio::sync::Barrier::new(1)),
+        );
+        tokio::pin!(update);
+
+        assert!(
+            futures::poll!(&mut update).is_pending(),
+            "barrier update should wait after its command is queued"
+        );
+        drop(cnc_rx);
+
+        assert!(update.await.is_err());
+    }
+
+    #[tokio::test]
+    async fn real_driver_barrier_update_is_acknowledged_and_blocks_followup_updates() {
+        let spawner = TpuSenderDriverSpawner {
+            stake_info_map: Arc::new(EmptyStakeInfo),
+            leader_tpu_info_service: Arc::new(EmptyLeaderTpuInfo),
+            driver_tx_channel_capacity: 1,
+        };
+        let session = spawner.spawn::<Nothing>(
+            Keypair::new(),
+            TpuSenderConfig::default(),
+            Arc::new(StakeBasedEvictionStrategy::default()),
+            Arc::new(IgnorantLeaderPredictor),
+            None,
+        );
+        let mut updater = session.identity_updater;
+        let driver_tx_sink = session.driver_tx_sink;
+        let driver_join_handle = session.driver_join_handle;
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+
+        timeout(
+            Duration::from_secs(1),
+            updater.update_identity_with_confirmation_barrier(Keypair::new(), Arc::clone(&barrier)),
+        )
+        .await
+        .expect("real driver should reach the identity barrier")
+        .expect("barrier identity update");
+
+        let barrier_result = updater
+            .update_identity_with_confirmation_barrier(
+                Keypair::new(),
+                Arc::new(tokio::sync::Barrier::new(1)),
+            )
+            .await;
+        assert!(matches!(
+            barrier_result,
+            Err(UpdateIdentityError::InProgress)
+        ));
+
+        let regular_result = updater.update_identity(Keypair::new()).await;
+        assert!(matches!(
+            regular_result,
+            Err(UpdateIdentityError::InProgress)
+        ));
+
+        barrier.wait().await;
+        timeout(Duration::from_secs(1), async {
+            loop {
+                match updater.update_identity(Keypair::new()).await {
+                    Err(UpdateIdentityError::InProgress) => tokio::task::yield_now().await,
+                    result => break result,
+                }
+            }
+        })
+        .await
+        .expect("driver should resume after barrier release")
+        .expect("identity update after barrier release");
+
+        drop(driver_tx_sink);
+        timeout(Duration::from_secs(1), driver_join_handle)
+            .await
+            .expect("driver should exit")
+            .expect("driver task");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancelling_barrier_ack_waiter_preserves_driver_participation() {
+        let spawner = TpuSenderDriverSpawner {
+            stake_info_map: Arc::new(EmptyStakeInfo),
+            leader_tpu_info_service: Arc::new(EmptyLeaderTpuInfo),
+            driver_tx_channel_capacity: 1,
+        };
+        let session = spawner.spawn::<Nothing>(
+            Keypair::new(),
+            TpuSenderConfig::default(),
+            Arc::new(StakeBasedEvictionStrategy::default()),
+            Arc::new(IgnorantLeaderPredictor),
+            None,
+        );
+        let updater = session.identity_updater;
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let mut update = Box::pin(
+            updater.update_identity_with_confirmation_barrier(Keypair::new(), Arc::clone(&barrier)),
+        );
+
+        assert!(
+            futures::poll!(&mut update).is_pending(),
+            "the command should be queued before the driver runs"
+        );
+        drop(update);
+
+        timeout(Duration::from_secs(1), barrier.wait())
+            .await
+            .expect("driver must still honor its fixed barrier participation");
+
+        drop(session.driver_tx_sink);
+        timeout(Duration::from_secs(1), session.driver_join_handle)
+            .await
+            .expect("driver should exit")
+            .expect("driver task");
     }
 
     #[test]

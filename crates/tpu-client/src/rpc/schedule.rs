@@ -9,6 +9,7 @@ use {
         sync::{Arc, RwLock, atomic::AtomicBool},
     },
     tokio::task::JoinHandle,
+    tokio_util::sync::CancellationToken,
 };
 
 pub const DEFAULT_AUTO_LEADER_SCHEDULE_CHECK_INTERVAL: std::time::Duration =
@@ -140,6 +141,34 @@ struct InnerManagedLeaderSchedule {
     fail: AtomicBool,
 }
 
+struct MarkManagedLeaderScheduleFailedOnDrop {
+    shared: Arc<RwLock<InnerManagedLeaderSchedule>>,
+}
+
+impl Drop for MarkManagedLeaderScheduleFailedOnDrop {
+    fn drop(&mut self) {
+        if let Ok(shared) = self.shared.read() {
+            shared
+                .fail
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+    }
+}
+
+fn monitor_managed_leader_schedule_task<F>(
+    shared: Arc<RwLock<InnerManagedLeaderSchedule>>,
+    task: F,
+) -> impl std::future::Future<Output = ()> + Send
+where
+    F: std::future::Future<Output = ()> + Send,
+{
+    let mark_failed_on_drop = MarkManagedLeaderScheduleFailedOnDrop { shared };
+    async move {
+        let _mark_failed_on_drop = mark_failed_on_drop;
+        task.await;
+    }
+}
+
 ///
 /// A managed leader schedule that automatically updates as epochs progress.
 ///
@@ -156,6 +185,20 @@ struct InnerManagedLeaderSchedule {
 #[derive(Clone)]
 pub struct ManagedLeaderSchedule {
     inner: Arc<RwLock<InnerManagedLeaderSchedule>>,
+    _lifecycle: Arc<ManagedLeaderScheduleLifecycle>,
+}
+
+#[derive(Default)]
+struct ManagedLeaderScheduleLifecycle {
+    shutdown: CancellationToken,
+}
+
+impl Drop for ManagedLeaderScheduleLifecycle {
+    fn drop(&mut self) {
+        // The background task holds the schedule data, but not this lifecycle Arc.
+        // Therefore this runs exactly when the last public schedule handle is dropped.
+        self.shutdown.cancel();
+    }
 }
 
 ///
@@ -181,6 +224,7 @@ impl ManagedLeaderSchedule {
                 double_buffer: [current, next],
                 fail: AtomicBool::new(false),
             })),
+            _lifecycle: Arc::new(ManagedLeaderScheduleLifecycle::default()),
         }
     }
 
@@ -284,7 +328,7 @@ async fn auto_leader_schedule_loop(
     config: ManagedLeaderScheduleConfig,
     shared: Arc<RwLock<InnerManagedLeaderSchedule>>,
     rpc_client: Arc<RpcClient>,
-    cancellation_token: tokio_util::sync::CancellationToken,
+    cancellation_token: CancellationToken,
 ) {
     let initial = match shared.read() {
         Ok(shared) => shared.double_buffer.clone(),
@@ -477,13 +521,30 @@ pub async fn spawn_managed_leader_schedule(
     }));
 
     let shared_clone = shared.clone();
-    let cancellation_token = tokio_util::sync::CancellationToken::new();
-    let loop_ct = cancellation_token.clone();
-    let jh = tokio::spawn(async move {
-        auto_leader_schedule_loop(config, shared_clone, rpc_client, loop_ct).await;
-    });
+    let lifecycle = Arc::new(ManagedLeaderScheduleLifecycle::default());
+    let loop_ct = lifecycle.shutdown.clone();
+    let shutdown = lifecycle.shutdown.clone();
+    let task = async move {
+        // The outer cancellation branch also drops any in-flight RPC request inside the loop.
+        tokio::select! {
+            _ = auto_leader_schedule_loop(config, shared_clone, rpc_client, loop_ct) => {}
+            _ = shutdown.cancelled() => {
+                tracing::info!("AutoLeaderSchedule: cancellation requested, stopping task");
+            }
+        }
+    };
+    let jh = tokio::spawn(monitor_managed_leader_schedule_task(
+        Arc::clone(&shared),
+        task,
+    ));
 
-    Ok((ManagedLeaderSchedule { inner: shared }, jh))
+    Ok((
+        ManagedLeaderSchedule {
+            inner: shared,
+            _lifecycle: lifecycle,
+        },
+        jh,
+    ))
 }
 
 #[cfg(test)]
@@ -502,6 +563,65 @@ mod tests {
     fn exponential_distribution(n: usize, base: f64, r: f64) -> Vec<u64> {
         // returns a vector of stake weights
         (0..n).map(|i| (base * r.powi(i as i32)) as u64).collect()
+    }
+
+    #[test]
+    fn dropping_last_schedule_cancels_background_work() {
+        let schedule = ManagedLeaderSchedule::new_for_tests(0, vec![Pubkey::new_unique()]);
+        let shutdown = schedule._lifecycle.shutdown.clone();
+        let schedule_clone = schedule.clone();
+
+        drop(schedule);
+        assert!(
+            !shutdown.is_cancelled(),
+            "dropping a non-last schedule clone must keep background work alive"
+        );
+
+        drop(schedule_clone);
+        assert!(
+            shutdown.is_cancelled(),
+            "dropping the last schedule clone must cancel background work"
+        );
+    }
+
+    #[test]
+    fn dropping_unpolled_schedule_task_marks_schedule_failed() {
+        let schedule = ManagedLeaderSchedule::new_for_tests(0, vec![Pubkey::new_unique()]);
+        let task = monitor_managed_leader_schedule_task(
+            Arc::clone(&schedule.inner),
+            std::future::pending(),
+        );
+
+        drop(task);
+
+        assert!(
+            schedule.get_leader(0).is_err(),
+            "dropping an unpolled schedule task must poison live schedule handles"
+        );
+    }
+
+    #[tokio::test]
+    async fn aborting_started_schedule_task_marks_schedule_failed() {
+        let schedule = ManagedLeaderSchedule::new_for_tests(0, vec![Pubkey::new_unique()]);
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let task = monitor_managed_leader_schedule_task(Arc::clone(&schedule.inner), async move {
+            let _ = started_tx.send(());
+            std::future::pending::<()>().await;
+        });
+        let handle = tokio::spawn(task);
+        started_rx.await.expect("schedule task should start");
+
+        handle.abort();
+        let result = handle.await;
+
+        assert!(
+            result.is_err_and(|err| err.is_cancelled()),
+            "schedule task should be cancelled"
+        );
+        assert!(
+            schedule.get_leader(0).is_err(),
+            "aborting a schedule task must poison live schedule handles"
+        );
     }
 
     #[test]
@@ -573,6 +693,7 @@ mod tests {
                 double_buffer: [current, next],
                 fail: AtomicBool::new(false),
             })),
+            _lifecycle: Arc::new(ManagedLeaderScheduleLifecycle::default()),
         };
 
         let batched = managed

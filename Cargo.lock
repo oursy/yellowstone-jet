@@ -3905,10 +3905,11 @@ checksum = "1979153aec32d4c501761af021e6ba881d6e05578b6518062cdc4f62970dc8e3"
 
 [[package]]
 name = "solana-message"
-version = "4.2.4"
+version = "4.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d2666e0ff38557ad1239d0fc42f4688fb9df0817fb12c041dbae90c2b2e3fa55"
+checksum = "a81a5ae2aa5c27925de70bc94fc42f1ca80a46c951ae101b419aa4eac9abb56a"
 dependencies = [
+ "lazy_static",
  "serde",
  "serde_derive",
  "solana-address 2.6.1",
@@ -4464,11 +4465,11 @@ dependencies = [
 
 [[package]]
 name = "solana-signer"
-version = "3.0.1"
+version = "3.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "520bd6021163ee517f4bdc7ae03ded904f97e11320001ba0b3355f45eb14f558"
+checksum = "5bfea97951fee8bae0d6038f39a5efcb6230ecdfe33425ac75196d1a1e3e3235"
 dependencies = [
- "solana-pubkey 4.2.0",
+ "solana-pubkey 3.0.0",
  "solana-signature",
  "solana-transaction-error",
 ]
@@ -4774,9 +4775,9 @@ dependencies = [
 
 [[package]]
 name = "solana-transaction"
-version = "4.1.5"
+version = "4.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6aa9b0f8543b99e1cb7db16a7c1a392139d82db57a90d262fb0a394807337bec"
+checksum = "45eb9e481a70f582be316d0bf2f8f8704079664e636a4e5d0c0d077f1c9de8f3"
 dependencies = [
  "serde",
  "serde_derive",
@@ -4813,9 +4814,9 @@ dependencies = [
 
 [[package]]
 name = "solana-transaction-error"
-version = "3.3.1"
+version = "3.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a949797bc1ac31836d0070e791083028a8c2e0d493fa4cf51c0bed7a04c65c22"
+checksum = "4a2165ad25b694c654d5395fc7a049452a192376e4c96a7fad05580f6ba5ba1c"
 dependencies = [
  "serde",
  "serde_derive",
@@ -6126,8 +6127,8 @@ dependencies = [
 
 [[package]]
 name = "yellowstone-grpc-client"
-version = "13.2.0"
-source = "git+https://github.com/rpcpool/yellowstone-grpc.git?rev=7b43d90#7b43d904a2b9ccb5da1eae40f155bb51ef86b67c"
+version = "13.2.1"
+source = "git+https://github.com/rpcpool/yellowstone-grpc.git?rev=fb83342#fb83342b3071bdf0adcbcc25b036baca318c59b2"
 dependencies = [
  "arc-swap",
  "bytes",
@@ -6147,7 +6148,7 @@ dependencies = [
 [[package]]
 name = "yellowstone-grpc-proto"
 version = "12.5.0"
-source = "git+https://github.com/rpcpool/yellowstone-grpc.git?rev=7b43d90#7b43d904a2b9ccb5da1eae40f155bb51ef86b67c"
+source = "git+https://github.com/rpcpool/yellowstone-grpc.git?rev=fb83342#fb83342b3071bdf0adcbcc25b036baca318c59b2"
 dependencies = [
  "anyhow",
  "prost",
@@ -6198,6 +6199,7 @@ dependencies = [
  "solana-system-interface 3.2.0",
  "solana-tls-utils",
  "solana-transaction",
+ "solana-transaction-error",
  "thiserror 2.0.18",
  "tokio",
  "tokio-stream",

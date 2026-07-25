@@ -29,6 +29,7 @@ use {
     solana_pubkey::Pubkey,
     solana_rpc_client::http_sender::HttpSender,
     std::{net::SocketAddr, sync::Arc},
+    tokio_util::sync::CancellationToken,
     yellowstone_grpc_client::{
         ClientTlsConfig, GeyserGrpcBuilder, GeyserGrpcBuilderError, GeyserGrpcClient,
     },
@@ -177,6 +178,19 @@ pub struct YellowstoneTpuSender {
     leader_tpu_info: Arc<dyn crate::core::LeaderTpuInfoService + Send + Sync>,
     tpu_port_kind: TpuPortKind,
     send_fanout_slots: u64,
+    _lifecycle: Arc<YellowstoneTpuSenderLifecycle>,
+}
+
+#[derive(Default)]
+struct YellowstoneTpuSenderLifecycle {
+    shutdown: CancellationToken,
+}
+
+impl Drop for YellowstoneTpuSenderLifecycle {
+    fn drop(&mut self) {
+        // This runs once, when the last sender lifecycle Arc is dropped.
+        self.shutdown.cancel();
+    }
 }
 
 ///
@@ -403,18 +417,23 @@ async fn create_yellowstone_tpu_sender_with_clients<CB>(
 where
     CB: TpuSenderResponseCallback,
 {
+    let mut dependencies = YellowstoneTpuDependencies::default();
+
     let (tpu_info_service, tpu_info_service_jh) =
         rpc_cluster_tpu_info_service(Arc::clone(&rpc_client), config.tpu_info).await?;
+    dependencies.push("tpu-info-service", tpu_info_service_jh);
 
     tracing::debug!("spawned tpu info service");
 
     let (managed_leader_schedule, managed_leader_schedule_jh) =
         spawn_managed_leader_schedule(Arc::clone(&rpc_client), config.schedule).await?;
+    dependencies.push("managed-leader-schedule", managed_leader_schedule_jh);
 
     tracing::debug!("spawned managed leader schedule");
 
     let (stake_service, stake_info_jh) =
         rpc_validator_stake_info_service(Arc::clone(&rpc_client), config.stake).await?;
+    dependencies.push("stake-info-service", stake_info_jh);
 
     tracing::debug!("spawned stake info service");
 
@@ -424,6 +443,7 @@ where
     } = slot_tracker::atomic_slot_tracker(grpc_client)
         .await?
         .ok_or(CreateTpuSenderError::GeyserSubscriptionEnded)?;
+    dependencies.push("slot-tracker", slot_tracker_jh);
 
     tracing::debug!("spawned slot tracker service");
 
@@ -444,6 +464,8 @@ where
         .min(MAX_SEND_FANOUT_SLOTS);
     let tpu_info_service: Arc<dyn crate::core::LeaderTpuInfoService + Send + Sync> =
         Arc::new(tpu_info_service);
+    let lifecycle = Arc::new(YellowstoneTpuSenderLifecycle::default());
+    let dependencies = dependencies.into_overseer(lifecycle.shutdown.clone());
     let base_tpu_sender = create_base_tpu_client(
         config.tpu,
         initial_identity,
@@ -465,24 +487,12 @@ where
         leader_tpu_info: Arc::clone(&tpu_info_service),
         tpu_port_kind,
         send_fanout_slots,
+        _lifecycle: Arc::clone(&lifecycle),
     };
-
-    let handles = vec![
-        tpu_info_service_jh,
-        managed_leader_schedule_jh,
-        stake_info_jh,
-        slot_tracker_jh,
-    ];
-    let handle_name_vec = vec![
-        "tpu-info-service",
-        "managed-leader-schedule",
-        "stake-info-service",
-        "slot-tracker",
-    ];
 
     Ok(NewYellowstoneTpuSender {
         sender,
-        related_objects_jh: tokio::spawn(yellowstone_tpu_deps_overseer(handle_name_vec, handles)),
+        related_objects_jh: tokio::spawn(dependencies),
     })
 }
 
@@ -562,27 +572,114 @@ where
     .await
 }
 
-async fn yellowstone_tpu_deps_overseer(
-    handle_name_vec: Vec<&'static str>,
-    handles: Vec<tokio::task::JoinHandle<()>>,
-) {
-    // Wait for the first task to finish
+#[derive(Default)]
+struct AbortDependenciesOnDrop(Vec<tokio::task::AbortHandle>);
 
-    let (finished_handle, i, rest) = futures::future::select_all(handles).await;
-    if finished_handle.is_err() {
-        tracing::error!(
-            "Yellowstone TPU sender dependency task '{}' has failed with {finished_handle:?}",
-            handle_name_vec.get(i).unwrap_or(&"unknown")
-        );
-    } else {
-        tracing::warn!(
-            "Yellowstone TPU sender dependency task '{}' has finished",
-            handle_name_vec.get(i).unwrap_or(&"unknown")
-        );
+impl AbortDependenciesOnDrop {
+    fn push(&mut self, handle: &tokio::task::JoinHandle<()>) {
+        self.0.push(handle.abort_handle());
     }
 
-    // Abort the rest
-    rest.into_iter().for_each(|jh| jh.abort());
+    fn abort_all(&self) {
+        self.0.iter().for_each(tokio::task::AbortHandle::abort);
+    }
+}
+
+impl Drop for AbortDependenciesOnDrop {
+    fn drop(&mut self) {
+        self.abort_all();
+    }
+}
+
+#[derive(Default)]
+struct YellowstoneTpuDependencies {
+    handle_names: Vec<&'static str>,
+    handles: Vec<tokio::task::JoinHandle<()>>,
+    abort_on_drop: AbortDependenciesOnDrop,
+}
+
+impl YellowstoneTpuDependencies {
+    fn push(&mut self, name: &'static str, handle: tokio::task::JoinHandle<()>) {
+        // Register the abort handle first so an unwind while growing either metadata vector
+        // cannot detach a newly-created dependency task.
+        self.abort_on_drop.push(&handle);
+        self.handle_names.push(name);
+        self.handles.push(handle);
+    }
+
+    fn into_overseer(
+        self,
+        shutdown: CancellationToken,
+    ) -> impl std::future::Future<Output = ()> + Send {
+        let Self {
+            handle_names,
+            handles,
+            abort_on_drop,
+        } = self;
+        yellowstone_tpu_deps_overseer_inner(handle_names, handles, shutdown, abort_on_drop)
+    }
+}
+
+async fn yellowstone_tpu_deps_overseer_inner(
+    handle_name_vec: Vec<&'static str>,
+    handles: Vec<tokio::task::JoinHandle<()>>,
+    shutdown: CancellationToken,
+    abort_on_drop: AbortDependenciesOnDrop,
+) {
+    // The guard was constructed before this future was created, so dropping an unpolled
+    // overseer still aborts every dependency.
+    if handles.is_empty() {
+        return;
+    }
+
+    // Keep ownership of every JoinHandle while selecting. On shutdown we abort first, then
+    // continue polling this same future so returning from the overseer is a cleanup barrier.
+    let mut first_dependency = Box::pin(futures::future::select_all(handles));
+    let ((finished_handle, i, rest), shutdown_triggered) = tokio::select! {
+        _ = shutdown.cancelled() => {
+            tracing::debug!(
+                "Last Yellowstone TPU sender dropped; aborting dependency tasks"
+            );
+            abort_on_drop.abort_all();
+            (first_dependency.await, true)
+        }
+        result = &mut first_dependency => {
+            (result, false)
+        }
+    };
+
+    if !shutdown_triggered {
+        if finished_handle.is_err() {
+            tracing::error!(
+                "Yellowstone TPU sender dependency task '{}' has failed with {finished_handle:?}",
+                handle_name_vec.get(i).unwrap_or(&"unknown")
+            );
+        } else {
+            tracing::warn!(
+                "Yellowstone TPU sender dependency task '{}' has finished",
+                handle_name_vec.get(i).unwrap_or(&"unknown")
+            );
+        }
+    }
+
+    abort_on_drop.abort_all();
+    for handle in rest {
+        let _ = handle.await;
+    }
+}
+
+#[cfg(test)]
+fn yellowstone_tpu_deps_overseer(
+    handle_name_vec: Vec<&'static str>,
+    handles: Vec<tokio::task::JoinHandle<()>>,
+    shutdown: CancellationToken,
+) -> impl std::future::Future<Output = ()> + Send {
+    assert_eq!(handle_name_vec.len(), handles.len());
+    let mut dependencies = YellowstoneTpuDependencies::default();
+    for (name, handle) in handle_name_vec.into_iter().zip(handles) {
+        dependencies.push(name, handle);
+    }
+    dependencies.into_overseer(shutdown)
 }
 
 #[cfg(test)]
@@ -598,7 +695,7 @@ mod tests {
                 atomic::{AtomicUsize, Ordering},
             },
         },
-        tokio::sync::mpsc,
+        tokio::sync::{mpsc, oneshot},
     };
 
     struct CountingTpuInfo {
@@ -628,6 +725,16 @@ mod tests {
         fn get_quic_tpu_fwd_socket_addr(&self, leader_pubkey: &Pubkey) -> Option<SocketAddr> {
             self.lookup_count.fetch_add(1, Ordering::Relaxed);
             self.addrs.get(leader_pubkey).copied()
+        }
+    }
+
+    struct NotifyOnDrop(Option<oneshot::Sender<()>>);
+
+    impl Drop for NotifyOnDrop {
+        fn drop(&mut self) {
+            if let Some(tx) = self.0.take() {
+                let _ = tx.send(());
+            }
         }
     }
 
@@ -670,8 +777,167 @@ mod tests {
             leader_tpu_info,
             tpu_port_kind: config.tpu_port,
             send_fanout_slots: config.send_fanout_slots.get().min(MAX_SEND_FANOUT_SLOTS),
+            _lifecycle: Arc::new(YellowstoneTpuSenderLifecycle::default()),
         };
         (sender, txn_rx)
+    }
+
+    #[tokio::test]
+    async fn dropping_last_sender_aborts_dependency_tasks() {
+        let tpu_info = Arc::new(CountingTpuInfo::new(HashMap::new()));
+        let (mut sender, _txn_rx) = test_sender(0, vec![], tpu_info);
+        let lifecycle = Arc::new(YellowstoneTpuSenderLifecycle::default());
+        let shutdown = lifecycle.shutdown.clone();
+        sender._lifecycle = lifecycle;
+        let sender_clone = sender.clone();
+
+        let (task_started_tx, task_started_rx) = oneshot::channel();
+        let (task_dropped_tx, mut task_dropped_rx) = oneshot::channel();
+        let dependency = tokio::spawn(async move {
+            let _notify_on_drop = NotifyOnDrop(Some(task_dropped_tx));
+            let _ = task_started_tx.send(());
+            std::future::pending::<()>().await;
+        });
+        task_started_rx
+            .await
+            .expect("dependency task should start before lifecycle shutdown");
+        let overseer = tokio::spawn(yellowstone_tpu_deps_overseer(
+            vec!["test-dependency"],
+            vec![dependency],
+            shutdown.clone(),
+        ));
+
+        drop(sender);
+        assert!(
+            !shutdown.is_cancelled(),
+            "dropping a non-last sender clone must keep dependencies alive"
+        );
+
+        drop(sender_clone);
+        assert!(
+            shutdown.is_cancelled(),
+            "dropping the last sender clone must request dependency shutdown"
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(1), overseer)
+            .await
+            .expect("dependency overseer should exit")
+            .expect("dependency overseer task");
+        task_dropped_rx
+            .try_recv()
+            .expect("overseer must wait for dependency cleanup before returning");
+    }
+
+    #[tokio::test]
+    async fn dependency_completion_aborts_remaining_tasks() {
+        let (pending_started_tx, pending_started_rx) = oneshot::channel();
+        let (pending_dropped_tx, mut pending_dropped_rx) = oneshot::channel();
+        let pending_dependency = tokio::spawn(async move {
+            let _notify_on_drop = NotifyOnDrop(Some(pending_dropped_tx));
+            let _ = pending_started_tx.send(());
+            std::future::pending::<()>().await;
+        });
+        pending_started_rx
+            .await
+            .expect("pending dependency should start");
+
+        let (finish_tx, finish_rx) = oneshot::channel();
+        let finishing_dependency = tokio::spawn(async move {
+            let _ = finish_rx.await;
+        });
+        let overseer = tokio::spawn(yellowstone_tpu_deps_overseer(
+            vec!["finishing-dependency", "pending-dependency"],
+            vec![finishing_dependency, pending_dependency],
+            CancellationToken::new(),
+        ));
+
+        finish_tx.send(()).expect("finish dependency");
+        tokio::time::timeout(std::time::Duration::from_secs(1), overseer)
+            .await
+            .expect("dependency overseer should exit")
+            .expect("dependency overseer task");
+        pending_dropped_rx
+            .try_recv()
+            .expect("overseer must drain remaining dependencies before returning");
+    }
+
+    #[tokio::test]
+    async fn dropping_partial_dependency_set_aborts_registered_tasks() {
+        let (dependency_started_tx, dependency_started_rx) = oneshot::channel();
+        let (dependency_dropped_tx, dependency_dropped_rx) = oneshot::channel();
+        let dependency = tokio::spawn(async move {
+            let _notify_on_drop = NotifyOnDrop(Some(dependency_dropped_tx));
+            let _ = dependency_started_tx.send(());
+            std::future::pending::<()>().await;
+        });
+        dependency_started_rx
+            .await
+            .expect("dependency task should start");
+
+        let mut dependencies = YellowstoneTpuDependencies::default();
+        dependencies.push("initialized-before-failure", dependency);
+        drop(dependencies);
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), dependency_dropped_rx)
+            .await
+            .expect("partially initialized dependency should be aborted")
+            .expect("dependency drop notification");
+    }
+
+    #[tokio::test]
+    async fn aborting_overseer_aborts_dependency_tasks() {
+        let (dependency_started_tx, dependency_started_rx) = oneshot::channel();
+        let (dependency_dropped_tx, dependency_dropped_rx) = oneshot::channel();
+        let dependency = tokio::spawn(async move {
+            let _notify_on_drop = NotifyOnDrop(Some(dependency_dropped_tx));
+            let _ = dependency_started_tx.send(());
+            std::future::pending::<()>().await;
+        });
+        dependency_started_rx
+            .await
+            .expect("dependency task should start");
+
+        let overseer = tokio::spawn(yellowstone_tpu_deps_overseer(
+            vec!["test-dependency"],
+            vec![dependency],
+            CancellationToken::new(),
+        ));
+        overseer.abort();
+        let result = overseer.await;
+        assert!(
+            result.is_err_and(|err| err.is_cancelled()),
+            "overseer should be cancelled"
+        );
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), dependency_dropped_rx)
+            .await
+            .expect("dependency should be aborted with overseer")
+            .expect("dependency drop notification");
+    }
+
+    #[tokio::test]
+    async fn dropping_unpolled_overseer_aborts_dependency_tasks() {
+        let (dependency_started_tx, dependency_started_rx) = oneshot::channel();
+        let (dependency_dropped_tx, dependency_dropped_rx) = oneshot::channel();
+        let dependency = tokio::spawn(async move {
+            let _notify_on_drop = NotifyOnDrop(Some(dependency_dropped_tx));
+            let _ = dependency_started_tx.send(());
+            std::future::pending::<()>().await;
+        });
+        dependency_started_rx
+            .await
+            .expect("dependency task should start");
+
+        let overseer = yellowstone_tpu_deps_overseer(
+            vec!["test-dependency"],
+            vec![dependency],
+            CancellationToken::new(),
+        );
+        drop(overseer);
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), dependency_dropped_rx)
+            .await
+            .expect("dependency should be aborted with unpolled overseer")
+            .expect("dependency drop notification");
     }
 
     #[tokio::test]

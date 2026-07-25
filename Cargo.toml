@@ -104,11 +104,12 @@ solana-sdk-ids = "3"
 solana-signature = "3"
 solana-signer = "3"
 solana-transaction = "4"
-solana-transaction-error = "3"
+# We need to pin this to 3.2.0 because 3.3.0 introduced a breaking change which prevents compilation of solana-storage-proto.
+solana-transaction-error = "=3.2.0"
 
 # Yellowstone
-yellowstone-grpc-proto = { git = "https://github.com/rpcpool/yellowstone-grpc.git", rev = "fd7cc64" }
-yellowstone-grpc-client = { git = "https://github.com/rpcpool/yellowstone-grpc.git", rev = "fd7cc64" }
+yellowstone-grpc-proto = { git = "https://github.com/rpcpool/yellowstone-grpc.git", rev = "fb83342" }
+yellowstone-grpc-client = { git = "https://github.com/rpcpool/yellowstone-grpc.git", rev = "fb83342" }
 yellowstone-jet-tpu-client = { path = "crates/tpu-client", version = "0.4.0" }
 
 [workspace.lints.clippy]

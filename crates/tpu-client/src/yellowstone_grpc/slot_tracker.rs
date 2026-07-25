@@ -218,7 +218,7 @@ async fn atomic_slot_tracker_reconnect_loop(
 }
 
 ///
-/// Creates an [`AtomicSlotTracker`] that tracks the latest slot from Yellowstone Geyser.
+/// Creates an atomic slot tracker that tracks the latest slot from Yellowstone Geyser.
 ///
 pub async fn atomic_slot_tracker(
     mut geyser_client: GeyserGrpcClient,
