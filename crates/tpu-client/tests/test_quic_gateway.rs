@@ -30,10 +30,22 @@ use {
             ConnectionEvictionStrategy, IgnorantLeaderPredictor, LeaderTpuInfoService, Nothing,
             PACKET_DATA_SIZE, StakeBasedEvictionStrategy, StakeSortedPeerSet,
             TpuSenderDriverSpawner, TpuSenderResponse, TpuSenderSessionContext, TpuSenderTxn,
-            TxDropReason, UpcomingLeaderPredictor, ValidatorStakeInfoService,
+            TxDropReason, UpcomingLeaderPredictor, V1_TRANSACTION_DATA_SIZE,
+            ValidatorStakeInfoService, transaction_data_size_limit,
         },
     },
 };
+
+#[test]
+fn transaction_size_limit_is_selected_from_the_wire_version() {
+    assert_eq!(transaction_data_size_limit(&[1]), PACKET_DATA_SIZE);
+    assert_eq!(transaction_data_size_limit(&[1, 0x80]), PACKET_DATA_SIZE);
+    assert_eq!(
+        transaction_data_size_limit(&[0x81]),
+        V1_TRANSACTION_DATA_SIZE
+    );
+    assert_eq!(transaction_data_size_limit(&[0x82]), PACKET_DATA_SIZE);
+}
 
 fn get_remote_pubkey(connection: &quinn::Connection) -> Option<Pubkey> {
     connection
@@ -193,6 +205,7 @@ impl MockedRemoteValidator {
                         // This code as been partially copied from agave source code:
                         let mut chunks: [Bytes; 4] = array::from_fn(|_| Bytes::new());
                         let mut total_chunks_read = 0;
+                        let mut combined = Vec::new();
 
                         while let Some(n_chunk) =
                             rx.read_chunks(&mut chunks).await.expect("read chunks")
@@ -201,11 +214,10 @@ impl MockedRemoteValidator {
                             if total_chunks_read > 4 {
                                 panic!("total_chunks_read > 4");
                             }
+                            for chunk in chunks.iter().take(n_chunk) {
+                                combined.extend_from_slice(chunk);
+                            }
                         }
-                        let combined = chunks.iter().fold(vec![], |mut acc, chunk| {
-                            acc.extend_from_slice(chunk);
-                            acc
-                        });
                         drop(rx);
                         let req = InterceptedTxn {
                             from: remote_key,
@@ -278,6 +290,50 @@ async fn send_buffer_should_land_properly() {
     let msg = String::from_utf8(spy_req.data).expect("utf8");
     assert_eq!(msg, "helloworld");
     assert_eq!(spy_req.from, gateway_kp.pubkey());
+}
+
+#[tokio::test]
+async fn v1_transaction_up_to_4096_bytes_should_land_without_unsafe_override() {
+    let rx_server_addr = generate_random_local_addr();
+    let rx_server_identity = Keypair::new();
+    let gateway_kp = Keypair::new();
+    let stake_info_map = MockStakeInfoMap::constant([(gateway_kp.pubkey(), 1000)]);
+    let fake_tpu_info_service =
+        FakeLeaderTpuInfoService::from_iter([(rx_server_identity.pubkey(), rx_server_addr)]);
+    let gateway_spawner = TpuSenderDriverSpawner {
+        stake_info_map: Arc::new(stake_info_map),
+        leader_tpu_info_service: Arc::new(fake_tpu_info_service),
+        driver_tx_channel_capacity: 100,
+    };
+    let (callback_tx, mut callback_rx) = mpsc::unbounded_channel();
+    let TpuSenderSessionContext {
+        identity_updater: _,
+        driver_tx_sink: transaction_sink,
+        driver_join_handle: _,
+    } = gateway_spawner.spawn_default_with_callback(gateway_kp, callback_tx);
+    let (mut client_rx, _rx_server_handle) = MockedRemoteValidator::spawn(
+        rx_server_identity.insecure_clone(),
+        rx_server_addr,
+        Default::default(),
+    );
+    let mut v1_wire = vec![0_u8; V1_TRANSACTION_DATA_SIZE];
+    v1_wire[0] = 0x81;
+    let tx_sig = Signature::new_unique();
+    transaction_sink
+        .send(TpuSenderTxn::from_owned(
+            tx_sig,
+            rx_server_identity.pubkey(),
+            v1_wire.clone(),
+        ))
+        .await
+        .expect("send v1 tx");
+
+    let intercepted = client_rx.recv().await.expect("recv v1 tx");
+    let TpuSenderResponse::TxSent(sent) = callback_rx.recv().await.expect("recv response") else {
+        panic!("Expected TpuSenderResponse::TxSent, got something else");
+    };
+    assert_eq!(sent.tx_sig, tx_sig);
+    assert_eq!(intercepted.data, v1_wire);
 }
 
 #[tokio::test]

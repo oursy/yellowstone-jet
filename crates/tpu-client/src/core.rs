@@ -77,7 +77,30 @@ use {
     },
 };
 
+/// Maximum complete Legacy or v0 transaction accepted by the TPU packet path.
 pub const PACKET_DATA_SIZE: usize = 1232;
+/// Maximum complete SIMD-0385 v1 transaction accepted by the QUIC stream path.
+pub const V1_TRANSACTION_DATA_SIZE: usize = 4096;
+
+const V1_TRANSACTION_PREFIX: u8 = 0x81;
+
+/// Returns the protocol limit selected by the complete transaction's wire discriminator.
+///
+/// Legacy and v0 transactions begin with their short-vector signature count. A v1
+/// transaction begins directly with the `0x81` message prefix and writes its fixed
+/// signature array after the message.
+#[must_use]
+pub fn transaction_data_size_limit(wire_transaction: &[u8]) -> usize {
+    if wire_transaction.first().copied() == Some(V1_TRANSACTION_PREFIX) {
+        V1_TRANSACTION_DATA_SIZE
+    } else {
+        PACKET_DATA_SIZE
+    }
+}
+
+fn transaction_data_size_is_valid(wire_transaction: &[u8]) -> bool {
+    wire_transaction.len() <= transaction_data_size_limit(wire_transaction)
+}
 
 pub const QUIC_SEND_FAIRNESS: bool = false;
 
@@ -730,7 +753,7 @@ pub enum TxDropReason {
     ///
     /// The transaction is invalid.
     ///
-    #[display("transaction packet size is exceed PACKET_DATA_SIZE (1232 bytes)")]
+    #[display("transaction exceeds the limit for its wire version")]
     InvalidPacketSize,
     ///
     /// The remote peer identity changed.
@@ -2304,7 +2327,8 @@ where
         let tx_id = tx.tx_sig;
 
         // Check size
-        if tx.wire.len() > PACKET_DATA_SIZE && !self.config.unsafe_allow_arbitrary_txn_size {
+        if !transaction_data_size_is_valid(&tx.wire) && !self.config.unsafe_allow_arbitrary_txn_size
+        {
             if let Some(callback) = self.response_outlet.as_ref() {
                 let tx_drop = TxDrop {
                     remote_peer_identity,
@@ -3577,8 +3601,9 @@ pub const fn module_path_for_test() -> &'static str {
 mod test {
     use {
         super::{
-            DriverCommand, StakeSortedPeerSet, TpuSenderIdentityUpdater, UpdateIdentityCommand,
-            UpdateIdentityError,
+            DriverCommand, PACKET_DATA_SIZE, StakeSortedPeerSet, TpuSenderIdentityUpdater,
+            UpdateIdentityCommand, UpdateIdentityError, V1_TRANSACTION_DATA_SIZE,
+            transaction_data_size_is_valid,
         },
         crate::{
             config::TpuSenderConfig,
@@ -3602,6 +3627,21 @@ mod test {
         },
         tokio::{sync::mpsc, time::timeout},
     };
+
+    #[test]
+    fn transaction_size_validation_preserves_legacy_limit_and_bounds_v1() {
+        assert!(transaction_data_size_is_valid(&vec![0; PACKET_DATA_SIZE]));
+        assert!(!transaction_data_size_is_valid(&vec![
+            0;
+            PACKET_DATA_SIZE + 1
+        ]));
+
+        let mut v1_max = vec![0; V1_TRANSACTION_DATA_SIZE];
+        v1_max[0] = 0x81;
+        assert!(transaction_data_size_is_valid(&v1_max));
+        v1_max.push(0);
+        assert!(!transaction_data_size_is_valid(&v1_max));
+    }
 
     struct EmptyStakeInfo;
 
