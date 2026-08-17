@@ -28,7 +28,6 @@ solana-pubkey = "3.0.0"
 solana-signature = "3.0.0"
 solana-signer = "3.0.0"
 solana-transaction = "3.0.0"
-solana-transaction-error = "3.0.0"
 
 # Yellowstone
 yellowstone-jet-tpu-client = { path = "../../crates/tpu-client", features = ["yellowstone-grpc"] }

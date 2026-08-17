@@ -10,7 +10,7 @@ use {
         rpc_config::{RpcBlockConfig, RpcSendTransactionConfig},
     },
     solana_commitment_config::{CommitmentConfig, CommitmentLevel},
-    solana_compute_budget_interface::ComputeBudgetInstruction,
+    solana_instruction::Instruction,
     solana_keypair::{Keypair, read_keypair_file},
     solana_message::{VersionedMessage, v0},
     solana_native_token::LAMPORTS_PER_SOL,
@@ -342,10 +342,10 @@ async fn main() -> anyhow::Result<()> {
 
             let mut instructions = vec![];
             if let Some(limit) = config.compute_budget_unit_limit {
-                instructions.push(ComputeBudgetInstruction::set_compute_unit_limit(limit));
+                instructions.push(set_compute_unit_limit(limit));
             }
             if let Some(price) = config.compute_budget_unit_price {
-                instructions.push(ComputeBudgetInstruction::set_compute_unit_price(price));
+                instructions.push(set_compute_unit_price(price));
             }
             let lamports = 5_000 + index;
             instructions.push(transfer(
@@ -416,4 +416,26 @@ async fn main() -> anyhow::Result<()> {
     }))
     .map_ok(|_| ())
     .await
+}
+
+fn set_compute_unit_limit(units: u32) -> Instruction {
+    let mut data = Vec::with_capacity(5);
+    data.push(2);
+    data.extend_from_slice(&units.to_le_bytes());
+    Instruction {
+        program_id: solana_sdk_ids::compute_budget::id(),
+        accounts: Vec::new(),
+        data,
+    }
+}
+
+fn set_compute_unit_price(micro_lamports: u64) -> Instruction {
+    let mut data = Vec::with_capacity(9);
+    data.push(3);
+    data.extend_from_slice(&micro_lamports.to_le_bytes());
+    Instruction {
+        program_id: solana_sdk_ids::compute_budget::id(),
+        accounts: Vec::new(),
+        data,
+    }
 }
