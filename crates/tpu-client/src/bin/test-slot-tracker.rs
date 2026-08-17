@@ -88,7 +88,7 @@ async fn main() {
     .expect("Some");
     let mut ctrlc = tokio::spawn(tokio::signal::ctrl_c());
 
-    let mut interval = tokio::time::interval(std::time::Duration::from_millis(400));
+    let mut interval = tokio::time::interval(std::time::Duration::from_millis(200));
     loop {
         tokio::select! {
             _ = interval.tick() => {},

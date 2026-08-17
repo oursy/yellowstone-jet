@@ -121,7 +121,7 @@ async fn main() {
 
     let mut ctrlc = tokio::spawn(tokio::signal::ctrl_c());
 
-    let mut interval = tokio::time::interval(std::time::Duration::from_millis(400));
+    let mut interval = tokio::time::interval(std::time::Duration::from_millis(200));
     let leader_predictor = YellowstoneUpcomingLeader {
         managed_schedule: managed_leader_schedule.clone(),
         slot_tracker: Arc::clone(&atomic_slot_tracker),

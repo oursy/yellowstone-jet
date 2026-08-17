@@ -47,7 +47,6 @@ use {
         WriteError, crypto::rustls::QuicClientConfig,
     },
     rustls::{NamedGroup, crypto::CryptoProvider},
-    solana_clock::DEFAULT_MS_PER_SLOT,
     solana_keypair::Keypair,
     solana_pubkey::Pubkey,
     solana_signature::Signature,
@@ -113,9 +112,12 @@ pub const QUIC_MAX_TIMEOUT: Duration = Duration::from_secs(10);
 /// Default duration after which an unused connection is evicted.
 pub const DEFAULT_UNUSED_CONNECTION_TTL: Duration = Duration::from_secs(10);
 
-pub const DEFAULT_LEADER_DURATION: Duration = Duration::from_secs(2); // 400ms * 4 rounded to seconds
-const CONSECUTIVE_LEADER_SLOTS: u64 = 4;
-
+/// Solana 4.2 slot-update cadence used by leader prediction and connection retention.
+pub const SLOT_UPDATE_INTERVAL: Duration = Duration::from_millis(200);
+/// Four consecutive leader slots at the Solana 4.2 slot-update cadence.
+pub const DEFAULT_LEADER_DURATION: Duration = Duration::from_millis(800);
+/// Refresh interval after three slot updates, before the four-slot leader window changes.
+pub const LEADER_PREDICTION_REFRESH_INTERVAL: Duration = Duration::from_millis(600);
 /// Keep-alive interval for QUIC connections.
 /// The rate at which we send PING frames to keep the connection alive.
 /// So apparently this is consistent across the network and solana client.
@@ -2865,11 +2867,8 @@ where
             .leader_prediction_lookahead
             .map(|nz| nz.get() as u64)
         {
-            // Predict every 3 slot.
-            let wait_dur_ms = DEFAULT_MS_PER_SLOT * (CONSECUTIVE_LEADER_SLOTS - 1);
-            let wait_dur =
-                Duration::from_millis(wait_dur_ms).max(Duration::from_millis(DEFAULT_MS_PER_SLOT));
-            self.next_leader_prediction_deadline = Instant::now() + wait_dur;
+            self.next_leader_prediction_deadline =
+                Instant::now() + LEADER_PREDICTION_REFRESH_INTERVAL;
 
             let upcoming_leaders = self
                 .leader_predictor
@@ -3601,7 +3600,8 @@ pub const fn module_path_for_test() -> &'static str {
 mod test {
     use {
         super::{
-            DriverCommand, PACKET_DATA_SIZE, StakeSortedPeerSet, TpuSenderIdentityUpdater,
+            DEFAULT_LEADER_DURATION, DriverCommand, LEADER_PREDICTION_REFRESH_INTERVAL,
+            PACKET_DATA_SIZE, SLOT_UPDATE_INTERVAL, StakeSortedPeerSet, TpuSenderIdentityUpdater,
             UpdateIdentityCommand, UpdateIdentityError, V1_TRANSACTION_DATA_SIZE,
             transaction_data_size_is_valid,
         },
@@ -3641,6 +3641,16 @@ mod test {
         assert!(transaction_data_size_is_valid(&v1_max));
         v1_max.push(0);
         assert!(!transaction_data_size_is_valid(&v1_max));
+    }
+
+    #[test]
+    fn solana_42_slot_timing_refreshes_before_the_four_slot_leader_window_changes() {
+        assert_eq!(SLOT_UPDATE_INTERVAL, Duration::from_millis(200));
+        assert_eq!(
+            LEADER_PREDICTION_REFRESH_INTERVAL,
+            Duration::from_millis(600)
+        );
+        assert_eq!(DEFAULT_LEADER_DURATION, Duration::from_millis(800));
     }
 
     struct EmptyStakeInfo;
