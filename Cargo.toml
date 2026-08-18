@@ -105,8 +105,8 @@ solana-signer = "3.0.1"
 solana-transaction = "4.1.6"
 
 # Yellowstone
-yellowstone-grpc-proto = { git = "https://github.com/rpcpool/yellowstone-grpc.git", rev = "ecdac26" }
-yellowstone-grpc-client = { git = "https://github.com/rpcpool/yellowstone-grpc.git", rev = "ecdac26" }
+yellowstone-grpc-proto = { git = "https://github.com/rpcpool/yellowstone-grpc.git", rev = "ed5e0406f21ec896f03bed2900a88b4453b093e1" }
+yellowstone-grpc-client = { git = "https://github.com/rpcpool/yellowstone-grpc.git", rev = "ed5e0406f21ec896f03bed2900a88b4453b093e1" }
 yellowstone-jet-tpu-client = { path = "crates/tpu-client", version = "0.4.0" }
 
 [workspace.lints.clippy]
