@@ -32,7 +32,7 @@ use {
     solana_client::nonblocking::rpc_client::RpcClient,
     solana_commitment_config::CommitmentConfig,
     solana_keypair::Keypair,
-    solana_message::{VersionedMessage, v0},
+    solana_message::{VersionedMessage, v1},
     solana_pubkey::Pubkey,
     solana_signer::Signer,
     solana_system_interface::instruction::transfer,
@@ -174,8 +174,15 @@ async fn main() {
         .expect("get_latest_blockhash");
 
     let transaction = VersionedTransaction::try_new(
-        VersionedMessage::V0(
-            v0::Message::try_compile(&identity.pubkey(), &instructions, &[], latest_blockhash)
+        VersionedMessage::V1(
+            v1::Message::try_compile_with_config(
+                &identity.pubkey(), &instructions, latest_blockhash,
+                v1::TransactionConfig::empty()
+                    .with_compute_unit_limit(600)
+                    .with_loaded_accounts_data_size_limit(32 * 1024)
+                    .with_heap_size(32 * 1024)
+                    .with_priority_fee(0),
+            )
                 .expect("try_compile"),
         ),
         &[&identity],
@@ -183,11 +190,11 @@ async fn main() {
     .expect("try_new");
     let signature = transaction.signatures[0];
     tracing::info!("generate transaction {signature} with send lamports {LAMPORTS}");
-    let bincoded_txn = bincode::serialize(&transaction).expect("bincode::serialize");
+    let wire_transaction = wincode::serialize(&transaction).expect("wincode::serialize");
 
     // Send the transaction to the current and upcoming unique leaders
     sender
-        .send_txn(signature, bincoded_txn)
+        .send_txn(signature, wire_transaction)
         .await
         .expect("send_transaction");
 

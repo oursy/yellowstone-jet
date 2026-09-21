@@ -74,6 +74,9 @@ jobs:
       - name: Run clippy
         run: cargo clippy --all-targets --tests --all-features -- -Dwarnings
 
+      - name: Run tests
+        run: cargo test --workspace --all-features --locked
+
       - name: Test build
         run: |
           cargo build --all-features

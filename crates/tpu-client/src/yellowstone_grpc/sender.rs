@@ -1,3 +1,6 @@
+pub use crate::core::{
+    TpuSenderResponse, TpuSenderResponseCallback, TxDrop, TxDropReason, TxFailed, TxSent,
+};
 use {
     crate::{
         config::{MAX_SEND_FANOUT_SLOTS, TpuPortKind, TpuSenderConfig},
@@ -33,10 +36,6 @@ use {
     yellowstone_grpc_client::{
         ClientTlsConfig, GeyserGrpcBuilder, GeyserGrpcBuilderError, GeyserGrpcClient,
     },
-};
-
-pub use crate::core::{
-    TpuSenderResponse, TpuSenderResponseCallback, TxDrop, TxDropReason, TxFailed, TxSent,
 };
 
 pub const DEFAULT_TPU_SENDER_CHANNEL_CAPACITY: usize = 100_000;
@@ -151,8 +150,15 @@ pub enum CreateTpuSenderError {
 ///
 /// let instructions = vec![transfer(&identity.pubkey(), &recipient, lamports)];
 /// let transaction = VersionedTransaction::try_new(
-///     VersionedMessage::V0(
-///         v0::Message::try_compile(&identity.pubkey(), &instructions, &[], latest_blockhash)
+///     VersionedMessage::V1(
+///         v1::Message::try_compile_with_config(
+///             &identity.pubkey(), &instructions, latest_blockhash,
+///             v1::TransactionConfig::empty()
+///                 .with_compute_unit_limit(600)
+///                 .with_loaded_accounts_data_size_limit(32 * 1024)
+///                 .with_heap_size(32 * 1024)
+///                 .with_priority_fee(0),
+///         )
 ///             .expect("try_compile"),
 ///     ),
 ///     &[&identity],
@@ -160,9 +166,9 @@ pub enum CreateTpuSenderError {
 /// .expect("try_new");
 /// let signature = transaction.signatures[0];
 /// tracing::info!("generate transaction {signature} with send lamports {lamports}");
-/// let bincoded_txn = bincode::serialize(&transaction).expect("bincode::serialize");
+/// let wire_transaction = wincode::serialize(&transaction).expect("wincode::serialize");
 /// sender
-///     .send_txn(signature, bincoded_txn)
+///     .send_txn(signature, wire_transaction)
 ///     .await
 ///     .expect("send_transaction");
 /// ```
@@ -360,7 +366,7 @@ impl YellowstoneTpuSender {
     /// # Arguments
     ///
     /// * `sig` - The signature identifying the transaction.
-    /// * `txn` - The bincoded transaction slice to send.
+    /// * `txn` - The wire-encoded transaction slice to send.
     ///
     /// # Returns
     ///

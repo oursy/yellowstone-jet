@@ -1,33 +1,22 @@
 [package]
 name = "example-jet-tpu-client"
 version = "0.1.0"
-edition = "2021"
+edition.workspace = true
+publish = false
 
 [dependencies]
-bincode = "1.3.3"
-clap = { version = "4.5.51", features = ["derive"] }
-dotenvy = "0.15.0"
-futures = "0.3.31"
-thiserror = "2.0.17"
-tokio = "1.48.0"
-
-# Agave Monorepo
-solana-bincode = "3.0.0"
-solana-client = "3.0.0"
-solana-rpc-client = "3.0.0"
-solana-rpc-client-api = "3.0.0"
-solana-system-interface = { version = "3.0.0", features = ["bincode"] }
-
-# Solana SDK
-solana-account = "3.0.0"
-solana-commitment-config = "3.0.0"
-solana-hash = "3.0.0"
-solana-keypair = "3.0.0"
-solana-message = "3.0.0"
-solana-pubkey = "3.0.0"
-solana-signature = "3.0.0"
-solana-signer = "3.0.0"
-solana-transaction = "3.0.0"
-
-# Yellowstone
-yellowstone-jet-tpu-client = { path = "../../crates/tpu-client", features = ["yellowstone-grpc"] }
+anyhow = { workspace = true }
+wincode = { workspace = true }
+clap = { workspace = true, features = ["derive"] }
+dotenvy = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+solana-client = { workspace = true }
+solana-system-interface = { workspace = true, features = ["bincode"] }
+solana-commitment-config = { workspace = true }
+solana-hash = { workspace = true }
+solana-keypair = { workspace = true }
+solana-message = { workspace = true }
+solana-pubkey = { workspace = true }
+solana-signer = { workspace = true }
+solana-transaction = { workspace = true }
+yellowstone-jet-tpu-client = { workspace = true, features = ["yellowstone-grpc"] }

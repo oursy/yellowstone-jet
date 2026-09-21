@@ -2660,7 +2660,7 @@ where
                         while let Ok(tx) = worker_completed.rx.try_recv() {
                             canceled_txn.push_back((tx, 1));
                         }
-                        canceled_txn.extend(worker_completed.pending_tx.into_iter());
+                        canceled_txn.extend(worker_completed.pending_tx);
                         canceled_txn
                     }
                     Err(_) => VecDeque::new(),
@@ -2907,10 +2907,7 @@ where
 
     fn try_evict_orphan_connections(&mut self) {
         let now = Instant::now();
-        loop {
-            let Some(oldest) = self.orphan_connection_set.oldest() else {
-                break;
-            };
+        while let Some(oldest) = self.orphan_connection_set.oldest() {
             if oldest + self.config.orphan_connection_ttl > now {
                 break;
             }

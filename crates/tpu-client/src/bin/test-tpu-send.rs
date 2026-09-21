@@ -4,7 +4,7 @@ use {
     solana_commitment_config::CommitmentConfig,
     solana_hash::Hash,
     solana_keypair::{Keypair, Signature},
-    solana_message::{VersionedMessage, v0},
+    solana_message::{VersionedMessage, v1},
     solana_pubkey::Pubkey,
     solana_signer::Signer,
     solana_system_interface::instruction::transfer,
@@ -41,32 +41,36 @@ async fn send_lamports(
     recipient: &Pubkey,
     lamports: u64,
     latest_blockhash: Hash,
-) -> Signature {
+) -> anyhow::Result<Signature> {
     let instructions = vec![transfer(&identity.pubkey(), recipient, lamports)];
 
     let transaction = VersionedTransaction::try_new(
-        VersionedMessage::V0(
-            v0::Message::try_compile(&identity.pubkey(), &instructions, &[], latest_blockhash)
-                .expect("try_compile"),
-        ),
-        &[&identity],
-    )
-    .expect("try_new");
+        VersionedMessage::V1(v1::Message::try_compile_with_config(
+            &identity.pubkey(),
+            &instructions,
+            latest_blockhash,
+            // Explicit resources for this example's single system transfer.
+            v1::TransactionConfig::empty()
+                .with_compute_unit_limit(600)
+                .with_loaded_accounts_data_size_limit(32 * 1024)
+                .with_heap_size(32 * 1024)
+                .with_priority_fee(0),
+        )?),
+        &[identity],
+    )?;
+    transaction.sanitize()?;
     let signature = transaction.signatures[0];
     tracing::info!("generate transaction {signature} with send lamports {lamports}");
-    let bincoded_txn = bincode::serialize(&transaction).expect("bincode::serialize");
+    let wire_transaction = wincode::serialize(&transaction)?;
 
     // Send the transaction to the current leader
-    tpu_sender
-        .send_txn(signature, bincoded_txn)
-        .await
-        .expect("send_transaction");
+    tpu_sender.send_txn(signature, wire_transaction).await?;
 
-    signature
+    Ok(signature)
 }
 
 #[tokio::main]
-async fn main() {
+async fn main() -> anyhow::Result<()> {
     use std::io::Write;
     setup_tracing();
 
@@ -158,13 +162,14 @@ async fn main() {
         LAMPORTS,
         latest_blockhash,
     )
-    .await;
+    .await?;
 
     writeln!(
         &mut out,
         "submitted transaction with signature `{signature}`"
     )
     .expect("writeln");
+    Ok(())
 }
 
 #[derive(clap::Parser, Debug)]

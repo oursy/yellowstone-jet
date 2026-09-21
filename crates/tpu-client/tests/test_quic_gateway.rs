@@ -4,11 +4,15 @@ use {
     crate::testkit::{build_validator_quic_tpu_endpoint, find_available_port},
     bytes::Bytes,
     quinn::{ConnectionError, VarInt},
+    solana_hash::Hash,
+    solana_instruction::Instruction,
     solana_keypair::Keypair,
+    solana_message::{VersionedMessage, v1},
     solana_pubkey::Pubkey,
     solana_signature::Signature,
     solana_signer::Signer,
     solana_tls_utils::get_pubkey_from_tls_certificate,
+    solana_transaction::versioned::VersionedTransaction,
     std::{
         array,
         collections::{HashMap, HashSet},
@@ -292,8 +296,54 @@ async fn send_buffer_should_land_properly() {
     assert_eq!(spy_req.from, gateway_kp.pubkey());
 }
 
+/// A signed transaction of exactly `wire_size` bytes, using the SDK's v1 codec.
+/// The instruction payload is inert test data; the mock validates transport, not execution.
+fn signed_v1_wire(wire_size: usize) -> (VersionedTransaction, Vec<u8>) {
+    let payer = Keypair::new();
+    let program_id = Pubkey::new_unique();
+    let blockhash = Hash::new_unique();
+    let compile = |data| {
+        VersionedTransaction::try_new(
+            VersionedMessage::V1(
+                v1::Message::try_compile_with_config(
+                    &payer.pubkey(),
+                    &[Instruction {
+                        program_id,
+                        accounts: vec![],
+                        data,
+                    }],
+                    blockhash,
+                    v1::TransactionConfig::empty()
+                        .with_compute_unit_limit(200_000)
+                        .with_loaded_accounts_data_size_limit(64 * 1024 * 1024)
+                        .with_heap_size(32 * 1024)
+                        .with_priority_fee(1234),
+                )
+                .expect("compile v1 fixture"),
+            ),
+            &[&payer],
+        )
+        .expect("sign v1 fixture")
+    };
+    let overhead = wincode::serialize(&compile(vec![]))
+        .expect("encode overhead")
+        .len();
+    let transaction = compile(vec![
+        0x42;
+        wire_size.checked_sub(overhead).expect("fixture size")
+    ]);
+    transaction.sanitize().expect("sanitize fixture");
+    transaction
+        .verify_and_hash_message()
+        .expect("verify fixture");
+    let wire = wincode::serialize(&transaction).expect("encode v1 fixture");
+    assert_eq!(wire.len(), wire_size);
+    assert_eq!(wire[0], 0x81);
+    (transaction, wire)
+}
+
 #[tokio::test]
-async fn v1_transaction_up_to_4096_bytes_should_land_without_unsafe_override() {
+async fn signed_v1_transactions_are_forwarded_losslessly_at_size_boundaries() {
     let rx_server_addr = generate_random_local_addr();
     let rx_server_identity = Keypair::new();
     let gateway_kp = Keypair::new();
@@ -316,24 +366,68 @@ async fn v1_transaction_up_to_4096_bytes_should_land_without_unsafe_override() {
         rx_server_addr,
         Default::default(),
     );
-    let mut v1_wire = vec![0_u8; V1_TRANSACTION_DATA_SIZE];
-    v1_wire[0] = 0x81;
-    let tx_sig = Signature::new_unique();
+    for size in [
+        PACKET_DATA_SIZE,
+        PACKET_DATA_SIZE + 1,
+        V1_TRANSACTION_DATA_SIZE,
+    ] {
+        let (transaction, wire) = signed_v1_wire(size);
+        let signature = transaction.signatures[0];
+        transaction_sink
+            .send(TpuSenderTxn::from_owned(
+                signature,
+                rx_server_identity.pubkey(),
+                wire.clone(),
+            ))
+            .await
+            .expect("send signed v1 transaction");
+        let intercepted = tokio::time::timeout(Duration::from_secs(5), client_rx.recv())
+            .await
+            .expect("receive deadline")
+            .expect("receive v1 transaction");
+        let response = tokio::time::timeout(Duration::from_secs(5), callback_rx.recv())
+            .await
+            .expect("callback deadline")
+            .expect("receive callback");
+        let TpuSenderResponse::TxSent(sent) = response else {
+            panic!("Expected TxSent, got {response:?}");
+        };
+        assert_eq!(sent.tx_sig, signature);
+        assert_eq!(intercepted.data, wire);
+        let decoded: VersionedTransaction =
+            wincode::deserialize(&intercepted.data).expect("decode received transaction");
+        assert_eq!(decoded, transaction);
+        decoded
+            .verify_and_hash_message()
+            .expect("verify received signatures");
+    }
+    let (transaction, mut oversize) = signed_v1_wire(V1_TRANSACTION_DATA_SIZE);
+    oversize.push(0);
     transaction_sink
         .send(TpuSenderTxn::from_owned(
-            tx_sig,
+            transaction.signatures[0],
             rx_server_identity.pubkey(),
-            v1_wire.clone(),
+            oversize,
         ))
         .await
-        .expect("send v1 tx");
-
-    let intercepted = client_rx.recv().await.expect("recv v1 tx");
-    let TpuSenderResponse::TxSent(sent) = callback_rx.recv().await.expect("recv response") else {
-        panic!("Expected TpuSenderResponse::TxSent, got something else");
+        .expect("submit oversized frame");
+    let response = tokio::time::timeout(Duration::from_secs(5), callback_rx.recv())
+        .await
+        .expect("drop deadline")
+        .expect("drop callback");
+    let TpuSenderResponse::TxDrop(dropped) = response else {
+        panic!("Expected TxDrop, got {response:?}");
     };
-    assert_eq!(sent.tx_sig, tx_sig);
-    assert_eq!(intercepted.data, v1_wire);
+    assert_eq!(dropped.dropped_tx_vec.len(), 1);
+    assert_eq!(
+        dropped.dropped_tx_vec[0].0.tx_sig,
+        transaction.signatures[0]
+    );
+    assert!(matches!(
+        dropped.drop_reason,
+        TxDropReason::InvalidPacketSize
+    ));
+    assert!(client_rx.try_recv().is_err());
 }
 
 #[tokio::test]
