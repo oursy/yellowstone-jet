@@ -272,6 +272,7 @@ mod tests {
                     slot: 1,
                     dead_error: None,
                     parent: None,
+                    bank_id: None,
                     status: SlotStatus::SlotProcessed as i32,
                 })),
                 filters: vec![SLOT_TRACKER_DM_FILTER_NAME.to_string()],
@@ -282,6 +283,7 @@ mod tests {
                     slot: 2,
                     dead_error: None,
                     parent: None,
+                    bank_id: None,
                     status: SlotStatus::SlotProcessed as i32,
                 })),
                 filters: vec![SLOT_TRACKER_DM_FILTER_NAME.to_string()],
@@ -292,6 +294,7 @@ mod tests {
                     slot: 3,
                     dead_error: None,
                     parent: None,
+                    bank_id: None,
                     status: SlotStatus::SlotFirstShredReceived as i32,
                 })),
                 filters: vec![SLOT_TRACKER_DM_FILTER_NAME.to_string()],
@@ -376,6 +379,7 @@ mod tests {
                     slot: 43,
                     dead_error: None,
                     parent: None,
+                    bank_id: None,
                     status: SlotStatus::SlotProcessed as i32,
                 })),
                 filters: vec![SLOT_TRACKER_DM_FILTER_NAME.to_string()],
@@ -391,6 +395,38 @@ mod tests {
                 .closed
                 .load(std::sync::atomic::Ordering::Relaxed)
         );
+    }
+
+    #[tokio::test]
+    async fn competing_banks_and_late_interslot_events_keep_the_routing_tip() {
+        let tracker = AtomicSlotTracker::new(102);
+        let updates = [
+            (100, Some(91)),
+            (102, Some(93)),
+            (101, None),
+            (103, Some(94)),
+        ]
+        .map(|(slot, bank_id)| {
+            Ok(SubscribeUpdate {
+                update_oneof: Some(UpdateOneof::Slot(SubscribeUpdateSlot {
+                    slot,
+                    bank_id,
+                    status: if bank_id.is_some() {
+                        SlotStatus::SlotProcessed
+                    } else {
+                        SlotStatus::SlotFirstShredReceived
+                    } as i32,
+                    ..Default::default()
+                })),
+                ..Default::default()
+            })
+        });
+        for update in updates {
+            let mut stream: SlotUpdateStream = Box::pin(tokio_stream::iter([update]));
+            process_slot_tracker_stream(&mut stream, &tracker).await;
+            assert!(tracker.load().expect("available routing tip") >= 102);
+        }
+        assert_eq!(tracker.load().expect("latest slot"), 103);
     }
 
     #[test]
