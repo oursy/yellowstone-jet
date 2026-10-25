@@ -38,8 +38,20 @@ name = "test_quic_gateway"
 path = "tests/test_quic_gateway.rs"
 required-features = ["intg-testing"]
 
+[[example]]
+name = "driver_api"
+path = "examples/driver_api.rs"
+required-features = ["driver"]
+
 [features]
 default = ["yellowstone-grpc"]
+# Public transport driver without a managed RPC/Yellowstone runtime.
+driver = []
+managed-rpc = [
+    "dep:async-trait", "dep:hyper", "dep:retry", "dep:serde_json",
+    "dep:solana-client", "dep:solana-rpc-client-api", "dep:solana-clock",
+    "dep:solana-commitment-config", "dep:tokio-stream",
+]
 examples = [
     "dep:anyhow",
     "dep:wincode",
@@ -55,14 +67,16 @@ examples = [
     "yellowstone-grpc",
 ]
 yellowstone-grpc = [
+    "managed-rpc",
     "dep:solana-rpc-client",
     "dep:yellowstone-grpc-client",
     "dep:yellowstone-grpc-proto",
 ]
-intg-testing = ["dep:tracing-subscriber"]
+intg-testing = ["managed-rpc", "dep:tracing-subscriber"]
 
 [dependencies]
-async-trait = { workspace = true }
+arc-swap = "1.9.2"
+async-trait = { workspace = true, optional = true }
 anyhow = { workspace = true, optional = true }
 wincode = { workspace = true, optional = true }
 bytes = { workspace = true }
@@ -71,31 +85,31 @@ derive_more = { workspace = true, features = ["display"] }
 dotenvy = { workspace = true, optional = true }
 futures = { workspace = true }
 humantime-serde = { workspace = true }
-hyper = { workspace = true }
+hyper = { workspace = true, optional = true }
 quinn = { workspace = true }
-retry = { workspace = true }
+retry = { workspace = true, optional = true }
 rustls = { workspace = true }
 serde = { workspace = true }
-serde_json = { workspace = true }
+serde_json = { workspace = true, optional = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
-tokio-stream = { workspace = true }
-tokio-util = { workspace = true }
+tokio-stream = { workspace = true, optional = true }
+tokio-util = { workspace = true, features = ["rt"] }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["ansi", "env-filter", "json"], optional = true }
 
 # Agave Monorepo
-solana-client = { workspace = true }
+solana-client = { workspace = true, optional = true }
 solana-net-utils = { workspace = true }
 solana-rpc-client = { workspace = true, optional = true }
-solana-rpc-client-api = { workspace = true }
-solana-streamer = { workspace = true }
+solana-rpc-client-api = { workspace = true, optional = true }
+solana-streamer = { workspace = true, features = ["agave-unstable-api"] }
 solana-system-interface = { workspace = true, optional = true, features = ["bincode"] }
 solana-tls-utils = { workspace = true, features = ["agave-unstable-api"] }
 
 # Solana SDK
-solana-clock = { workspace = true }
-solana-commitment-config = { workspace = true }
+solana-clock = { workspace = true, optional = true }
+solana-commitment-config = { workspace = true, optional = true }
 solana-hash = { workspace = true, optional = true }
 solana-keypair = { workspace = true }
 solana-message = { workspace = true, optional = true }

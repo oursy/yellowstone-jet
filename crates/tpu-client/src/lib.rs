@@ -43,14 +43,17 @@ pub mod config;
 ///
 /// module for the internal core tpu sending driver logic
 ///
-#[cfg(any(feature = "examples", feature = "intg-testing"))]
+#[cfg(any(feature = "driver", feature = "examples", feature = "intg-testing"))]
 pub mod core;
-#[cfg(not(any(feature = "examples", feature = "intg-testing")))]
+#[cfg(not(any(feature = "driver", feature = "examples", feature = "intg-testing")))]
 #[allow(dead_code)]
 mod core;
+/// Prepared-only, bounded admission to existing transport workers.
+pub mod prepared;
 ///
 /// module for common tpu sender implementation
 ///
+#[cfg(any(feature = "yellowstone-grpc", feature = "intg-testing"))]
 mod sender;
 
 ///
@@ -58,13 +61,17 @@ mod sender;
 ///
 #[cfg(any(feature = "examples", feature = "intg-testing"))]
 pub mod rpc;
-#[cfg(not(any(feature = "examples", feature = "intg-testing")))]
+#[cfg(all(
+    feature = "managed-rpc",
+    not(any(feature = "examples", feature = "intg-testing"))
+))]
 #[allow(dead_code)]
 mod rpc;
 
 ///
 /// module for internal slot tracking
 ///
+#[cfg(feature = "yellowstone-grpc")]
 mod slot;
 
 ///

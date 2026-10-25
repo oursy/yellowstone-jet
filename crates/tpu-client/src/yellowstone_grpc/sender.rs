@@ -267,11 +267,7 @@ impl YellowstoneTpuSender {
             queued_addr = Some(addr);
         }
 
-        let tpu_txn = TpuSenderTxn {
-            tx_sig: sig,
-            remote_peer: leader,
-            wire: wire_txn.clone(),
-        };
+        let tpu_txn = TpuSenderTxn::from_bytes(sig, leader, wire_txn.clone());
         self.base_tpu_sender
             .try_send_txn(tpu_txn)
             .map_err(|err| match err {

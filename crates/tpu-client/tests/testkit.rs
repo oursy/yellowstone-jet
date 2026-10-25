@@ -48,6 +48,15 @@ pub fn build_random_endpoint(addr: SocketAddr) -> (quinn::Endpoint, Keypair) {
 
 #[allow(dead_code)]
 pub fn build_validator_quic_tpu_endpoint(kp: &Keypair, addr: SocketAddr) -> quinn::Endpoint {
+    build_validator_endpoint_with_transport(kp, addr, quinn::TransportConfig::default())
+}
+
+#[allow(dead_code)]
+pub fn build_validator_endpoint_with_transport(
+    kp: &Keypair,
+    addr: SocketAddr,
+    transport: quinn::TransportConfig,
+) -> quinn::Endpoint {
     let (cert, priv_key) = new_dummy_x509_certificate(kp);
     let mut crypto = rustls::ServerConfig::builder_with_provider(Arc::new(crypto_provider()))
         .with_safe_default_protocol_versions()
@@ -59,7 +68,8 @@ pub fn build_validator_quic_tpu_endpoint(kp: &Keypair, addr: SocketAddr) -> quin
 
     let quic_server_config = QuicServerConfig::try_from(crypto).expect("quic server config");
 
-    let config = quinn::ServerConfig::with_crypto(Arc::new(quic_server_config));
+    let mut config = quinn::ServerConfig::with_crypto(Arc::new(quic_server_config));
+    config.transport_config(Arc::new(transport));
     quinn::Endpoint::server(config, addr).expect("quinn server endpoint")
 }
 

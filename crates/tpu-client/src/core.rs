@@ -39,9 +39,15 @@
 //!
 
 use {
-    crate::config::{TpuOverrideInfo, TpuPortKind, TpuSenderConfig},
+    crate::{
+        config::{TpuOverrideInfo, TpuPortKind, TpuSenderConfig},
+        prepared::{
+            Completion, PreparedFailure, PreparedPeers, PreparedSender, PreparedStatus, Readiness,
+        },
+    },
     bytes::Bytes,
     derive_more::Display,
+    futures::FutureExt,
     quinn::{
         ClientConfig, Connection, ConnectionError, Endpoint, IdleTimeout, TransportConfig, VarInt,
         WriteError, crypto::rustls::QuicClientConfig,
@@ -55,13 +61,16 @@ use {
     solana_tls_utils::{QuicClientCertificate, SkipServerVerification, new_dummy_x509_certificate},
     std::{
         collections::{BTreeMap, HashMap, HashSet, VecDeque},
+        future::{Future, poll_fn},
         net::{IpAddr, Ipv4Addr, SocketAddr},
         num::NonZeroUsize,
+        panic::{AssertUnwindSafe, resume_unwind},
         pin::Pin,
         sync::{
-            Arc, Mutex as StdMutex,
+            Arc,
             atomic::{AtomicBool, Ordering},
         },
+        task::Poll,
         time::{Duration, Instant},
     },
     tokio::{
@@ -74,6 +83,7 @@ use {
         task::{self, Id, JoinError, JoinHandle, JoinSet},
         time::{Sleep, interval},
     },
+    tokio_util::sync::CancellationToken,
 };
 
 /// Maximum complete Legacy or v0 transaction accepted by the TPU packet path.
@@ -97,7 +107,7 @@ pub fn transaction_data_size_limit(wire_transaction: &[u8]) -> usize {
     }
 }
 
-fn transaction_data_size_is_valid(wire_transaction: &[u8]) -> bool {
+pub(crate) fn transaction_data_size_is_valid(wire_transaction: &[u8]) -> bool {
     wire_transaction.len() <= transaction_data_size_limit(wire_transaction)
 }
 
@@ -201,7 +211,15 @@ struct TxWorkerSenderHandle {
     remote_peer_addr: SocketAddr,
     connection_version: u64,
     sender: mpsc::Sender<TpuSenderTxn>,
-    cancel_notify: Arc<Notify>,
+    cancel: CancellationToken,
+    alive: Arc<AtomicBool>,
+}
+
+impl TxWorkerSenderHandle {
+    fn retire(&self) {
+        self.alive.store(false, Ordering::Release);
+        self.cancel.cancel();
+    }
 }
 
 struct WaitingEviction {
@@ -321,6 +339,8 @@ pub(crate) struct TpuSenderDriver<CB> {
     /// Transaction inlet channel : where transaction comes from.
     ///
     tx_inlet: mpsc::Receiver<TpuSenderTxn>,
+    shutdown: CancellationToken,
+    prepared: PreparedPeers,
 
     ///
     /// Outlet to send transaction "sent" status.
@@ -624,6 +644,8 @@ pub struct TpuSenderTxn {
     pub(crate) wire: Bytes,
     /// The pubkey of the remote peer to send the transaction to.
     pub remote_peer: Pubkey,
+    deadline: Option<Instant>,
+    pub(crate) completion: Option<Completion>,
 }
 
 impl TpuSenderTxn {
@@ -632,6 +654,8 @@ impl TpuSenderTxn {
             tx_sig,
             wire,
             remote_peer,
+            deadline: None,
+            completion: None,
         }
     }
 
@@ -639,10 +663,23 @@ impl TpuSenderTxn {
     where
         T: AsRef<[u8]> + Send + 'static,
     {
-        Self {
-            tx_sig,
-            wire: Bytes::from_owner(wire),
-            remote_peer,
+        Self::from_bytes(tx_sig, remote_peer, Bytes::from_owner(wire))
+    }
+
+    /// An absolute local send deadline, including time spent queued. The worker
+    /// also caps each send by its configured send_timeout. The absolute deadline
+    /// is retained across retries and connection replacements.
+    pub fn with_deadline(mut self, deadline: Instant) -> Self {
+        self.deadline = Some(deadline);
+        self
+    }
+
+    fn reject_prepared(&mut self) -> bool {
+        if let Some(completion) = self.completion.take() {
+            completion.fail(PreparedFailure::Retired);
+            true
+        } else {
+            false
         }
     }
 }
@@ -652,6 +689,11 @@ impl TpuSenderTxn {
 ///
 #[derive(thiserror::Error, Debug)]
 pub enum SendTxError {
+    #[error("sender canceled")]
+    Canceled,
+    /// The bounded send interval expired. This request must not be retried.
+    #[error("send deadline exceeded")]
+    DeadlineExceeded,
     ///
     /// [`ConnectionError`] from quinn when attempting to write to the stream.
     #[error(transparent)]
@@ -762,6 +804,9 @@ pub enum TxDropReason {
     ///
     #[display("driver QUIC identity changed")]
     DriverIdentityChanged,
+    /// The session owner is shutting down; queued requests will not be replayed.
+    #[display("driver shutdown")]
+    DriverShutdown,
 }
 
 ///
@@ -920,6 +965,7 @@ impl ConnectingTask {
 /// Although it might seem appealing to use multiple streams across different Tokio tasks on the same connection,
 /// benchmarks conducted by the Anza team indicate that this approach degrades performance rather than improving it.
 struct QuicTxSenderWorker<CB> {
+    _readiness: Readiness,
     remote_peer: Pubkey,
     remote_peer_addr: SocketAddr,
     connection: Arc<Connection>,
@@ -928,8 +974,9 @@ struct QuicTxSenderWorker<CB> {
     incoming_rx: mpsc::Receiver<TpuSenderTxn>,
     output_tx: Option<CB>,
     tx_queue: VecDeque<(TpuSenderTxn, usize)>,
-    cancel_notify: Arc<Notify>,
+    cancel: CancellationToken,
     max_tx_attempt: NonZeroUsize,
+    send_timeout: Duration,
     txn_sent: usize,
 }
 
@@ -948,21 +995,74 @@ struct TxSenderWorkerCompleted {
     canceled: bool,
 }
 
+// Tokio's timeout polls its inner future before its timer. Check the monotonic
+// deadline on every poll so a newly writable stream cannot win after expiry.
+async fn before_send_deadline<T>(
+    deadline: Instant,
+    cancel: &CancellationToken,
+    operation: impl Future<Output = Result<T, SendTxError>>,
+) -> Result<T, SendTxError> {
+    tokio::pin!(operation);
+    let operation = tokio::time::timeout_at(
+        deadline.into(),
+        poll_fn(|cx| {
+            if cancel.is_cancelled() {
+                Poll::Ready(Err(SendTxError::Canceled))
+            } else if Instant::now() >= deadline {
+                Poll::Ready(Err(SendTxError::DeadlineExceeded))
+            } else {
+                operation.as_mut().poll(cx)
+            }
+        }),
+    );
+    tokio::select! {
+        biased;
+        _ = cancel.cancelled() => Err(SendTxError::Canceled),
+        result = operation => result.map_err(|_| SendTxError::DeadlineExceeded)?,
+    }
+}
+
 impl<CB> QuicTxSenderWorker<CB>
 where
     CB: TpuSenderResponseCallback,
 {
-    async fn send_tx(&mut self, tx: &[u8]) -> Result<SentOk, SendTxError> {
+    async fn send_tx(
+        &mut self,
+        tx: &[u8],
+        request_deadline: Option<Instant>,
+        completion: Option<&mut Completion>,
+    ) -> Result<SentOk, SendTxError> {
         let t = Instant::now();
-        let mut uni = self.connection.open_uni().await?;
-        uni.write_all(tx).await.map_err(|e| match e {
-            WriteError::Stopped(var_int) => SendTxError::StreamStopped(var_int),
-            WriteError::ConnectionLost(connection_error) => {
-                SendTxError::ConnectionError(connection_error)
+        let deadline = t
+            .checked_add(self.send_timeout)
+            .ok_or(SendTxError::DeadlineExceeded)?;
+        let deadline = request_deadline.map_or(deadline, |requested| requested.min(deadline));
+        let mut uni = before_send_deadline(deadline, &self.cancel, async {
+            self.connection.open_uni().await.map_err(SendTxError::from)
+        })
+        .await?;
+        let result = before_send_deadline(deadline, &self.cancel, async {
+            if let Some(completion) = completion {
+                completion.mark_exposed();
             }
-            WriteError::ClosedStream => SendTxError::StreamClosed,
-            WriteError::ZeroRttRejected => SendTxError::ZeroRttRejected,
-        })?;
+            uni.write_all(tx).await.map_err(|e| match e {
+                WriteError::Stopped(var_int) => SendTxError::StreamStopped(var_int),
+                WriteError::ConnectionLost(connection_error) => {
+                    SendTxError::ConnectionError(connection_error)
+                }
+                WriteError::ClosedStream => SendTxError::StreamClosed,
+                WriteError::ZeroRttRejected => SendTxError::ZeroRttRejected,
+            })
+        })
+        .await;
+        if let Err(error) = result {
+            // write_all may have exposed a prefix. Drop alone would finish and
+            // keep retransmitting; reset discards remaining local data but does
+            // not assert that bytes already received by the peer were undone.
+            let _ = uni.reset(VarInt::from_u32(0));
+            return Err(error);
+        }
+        uni.finish().map_err(|_| SendTxError::StreamClosed)?;
         self.txn_sent = self.txn_sent.saturating_add(1);
         let e2e_time = t.elapsed();
         let ok = SentOk { e2e_time };
@@ -970,10 +1070,30 @@ where
     }
     async fn process_tx(
         &mut self,
-        tx: TpuSenderTxn,
+        mut tx: TpuSenderTxn,
         attempt: usize,
     ) -> Option<TxSenderWorkerError> {
-        let result = self.send_tx(tx.wire.as_ref()).await;
+        let result = self
+            .send_tx(tx.wire.as_ref(), tx.deadline, tx.completion.as_mut())
+            .await;
+        if let Some(completion) = tx.completion.take() {
+            return match result {
+                Ok(_) => {
+                    completion.finish(PreparedStatus::LocallyWritten);
+                    None
+                }
+                Err(error) => {
+                    completion.fail(PreparedFailure::from(&error));
+                    match error {
+                        SendTxError::ConnectionError(error) => {
+                            Some(TxSenderWorkerError::ConnectionLost(error))
+                        }
+                        SendTxError::ZeroRttRejected => Some(TxSenderWorkerError::ZeroRttRejected),
+                        _ => None,
+                    }
+                }
+            };
+        }
         let remote_addr = self.remote_peer_addr;
         let tx_sig = tx.tx_sig;
         match result {
@@ -994,7 +1114,9 @@ where
                 None
             }
             Err(e) => {
-                if attempt >= self.max_tx_attempt.get() {
+                if matches!(e, SendTxError::DeadlineExceeded | SendTxError::Canceled)
+                    || attempt >= self.max_tx_attempt.get()
+                {
                     tracing::warn!(
                         "Giving up sending transaction to remote peer: {}, client identity: {}, after {} attempts, {} txn sent so far: {:?}",
                         self.remote_peer,
@@ -1024,6 +1146,7 @@ where
                 }
 
                 match e {
+                    SendTxError::DeadlineExceeded | SendTxError::Canceled => None,
                     SendTxError::ConnectionError(connection_error) => {
                         Some(TxSenderWorkerError::ConnectionLost(connection_error))
                     }
@@ -1049,7 +1172,10 @@ where
     }
 
     async fn try_process_tx_in_queue(&mut self) -> Option<TxSenderWorkerError> {
-        while let Some((tx, attempt)) = self.tx_queue.pop_front() {
+        while !self.cancel.is_cancelled() {
+            let Some((tx, attempt)) = self.tx_queue.pop_front() else {
+                break;
+            };
             tracing::trace!(
                 "Processing tx: {} for remote peer: {} with attempt: {}",
                 tx.tx_sig,
@@ -1064,6 +1190,7 @@ where
     }
 
     async fn run(mut self) -> TxSenderWorkerCompleted {
+        let _retire = self.cancel.clone().drop_guard();
         let mut canceled = false;
         let mut last_activity = Instant::now();
         let mut burst_timer = Box::pin(tokio::time::sleep_until(
@@ -1079,6 +1206,10 @@ where
 
             if let Some(e) = self.try_process_tx_in_queue().await {
                 break Some(e);
+            }
+            if self.cancel.is_cancelled() {
+                canceled = true;
+                break None;
             }
             // Every 10 seconds we will look if there is new tx to processed.
             // If not we will close the worker to free up resources.
@@ -1113,7 +1244,7 @@ where
                     // Agave client do connection eviction and can close the connection for least used or lower staked peers.
                     break Some(err.into())
                 }
-                _ = self.cancel_notify.notified() => {
+                _ = self.cancel.cancelled() => {
                     tracing::debug!("Transaction sender worker for remote peer: {:?} is canceled", self.remote_peer);
                     canceled = true;
                     break None;
@@ -1714,6 +1845,36 @@ where
             return;
         };
 
+        // A closed Quinn connection cannot be reused, even while its former
+        // workers are still being joined. Retire only that physical generation.
+        let closed_version = self
+            .connection_map
+            .get(&remote_peer_addr)
+            .filter(|connection| connection.conn.close_reason().is_some())
+            .map(|connection| connection.connection_version);
+        if let Some(version) = closed_version {
+            if let Some(closed) = self.connection_map.remove(&remote_peer_addr) {
+                for peer in closed.multiplexed_remote_peer_identity_with_stake.keys() {
+                    if let Some(worker) = self.tx_worker_handle_map.get(peer)
+                        && worker.connection_version == version
+                    {
+                        worker.retire();
+                        self.prepared.remove(peer);
+                    }
+                }
+            }
+            self.orphan_connection_set
+                .remove(&remote_peer_addr, version);
+            self.pending_connection_eviction_set
+                .remove(&ConnectionEviction {
+                    remote_peer_addr,
+                    connection_version: version,
+                });
+            self.active_staked_sorted_remote_peer_addr
+                .remove(&remote_peer_addr);
+            self.unblock_eviction_waiting_connection();
+        }
+
         if self
             .pending_connection_eviction_set
             .contains_socket_addr(&remote_peer_addr)
@@ -1839,25 +2000,32 @@ where
             remote_peer_identity,
             reason
         );
-        if let Some(tx_queues) = self.tx_queues.remove(&remote_peer_identity)
-            && let Some(callback) = self.response_outlet.as_ref()
-        {
+        if let Some(mut tx_queues) = self.tx_queues.remove(&remote_peer_identity) {
+            tx_queues.retain_mut(|(tx, _)| !tx.reject_prepared());
+            if tx_queues.is_empty() {
+                return;
+            }
             let tx_drop = TxDrop {
                 remote_peer_identity,
                 drop_reason: reason,
                 dropped_tx_vec: tx_queues,
             };
-            callback.call(TpuSenderResponse::TxDrop(tx_drop));
+            if let Some(callback) = self.response_outlet.as_ref() {
+                callback.call(TpuSenderResponse::TxDrop(tx_drop));
+            }
         }
     }
 
     fn drop_single_tx(
         &self,
         remote_peer_identity: Pubkey,
-        tx: TpuSenderTxn,
+        mut tx: TpuSenderTxn,
         attempt: usize,
         reason: TxDropReason,
     ) {
+        if tx.reject_prepared() {
+            return;
+        }
         if let Some(callback) = self.response_outlet.as_ref() {
             let tx_drop = TxDrop {
                 remote_peer_identity,
@@ -1871,9 +2039,13 @@ where
     fn queue_tx_or_drop(
         &mut self,
         remote_peer_identity: Pubkey,
-        tx: TpuSenderTxn,
+        mut tx: TpuSenderTxn,
         attempt: usize,
     ) -> bool {
+        // Prepared work belongs to its original generation, never the rescue queue.
+        if tx.reject_prepared() {
+            return false;
+        }
         let queued_len = self
             .tx_queues
             .get(&remote_peer_identity)
@@ -1969,7 +2141,7 @@ where
             if let Some(handle) = self.tx_worker_handle_map.get(&peer) {
                 let remote_peer_addr = handle.remote_peer_addr;
                 self.being_evicted_peers.insert(peer);
-                cancel_handles_vec.push(Arc::clone(&handle.cancel_notify));
+                cancel_handles_vec.push((Arc::clone(&handle.alive), handle.cancel.clone()));
                 if let Some(active_conn) = self.connection_map.get(&remote_peer_addr) {
                     if active_conn.connection_version != handle.connection_version {
                         // This means the connection has been re-established since the worker was created.
@@ -1988,8 +2160,8 @@ where
                     {
                         self.being_evicted_peers.insert(*multiplexed_peer);
                         if let Some(handle) = self.tx_worker_handle_map.get(multiplexed_peer) {
-                            let cancel_notify = Arc::clone(&handle.cancel_notify);
-                            cancel_handles_vec.push(cancel_notify);
+                            cancel_handles_vec
+                                .push((Arc::clone(&handle.alive), handle.cancel.clone()));
                         }
                     }
                 }
@@ -2000,8 +2172,9 @@ where
             "Evicting {} remote peer connections",
             cancel_handles_vec.len()
         );
-        for cancel_handle in cancel_handles_vec {
-            cancel_handle.notify_one();
+        for (alive, cancel_handle) in cancel_handles_vec {
+            alive.store(false, Ordering::Release);
+            cancel_handle.cancel();
         }
     }
 
@@ -2044,9 +2217,18 @@ where
         };
 
         let output_tx = self.response_outlet.clone();
-        let cancel_notify = Arc::new(Notify::new());
+        let cancel = CancellationToken::new();
+        let alive = Arc::new(AtomicBool::new(true));
+        self.prepared.publish(
+            remote_peer_identity,
+            remote_peer_addr,
+            tx.clone(),
+            alive.clone(),
+            self.config.transaction_sender_worker_channel_capacity,
+        );
 
         let worker = QuicTxSenderWorker {
+            _readiness: Readiness(alive.clone()),
             remote_peer: remote_peer_identity,
             remote_peer_addr,
             connection,
@@ -2057,17 +2239,19 @@ where
                 .tx_queues
                 .remove(&remote_peer_identity)
                 .unwrap_or_default(),
-            cancel_notify: Arc::clone(&cancel_notify),
+            cancel: cancel.clone(),
             max_tx_attempt: self.config.max_send_attempt,
+            send_timeout: self.config.send_timeout,
             txn_sent: 0,
         };
 
         let worker_fut = worker.run();
         let ah = self.tx_worker_set.spawn(worker_fut);
         let handle = TxWorkerSenderHandle {
+            alive,
             remote_peer_addr,
             sender: tx,
-            cancel_notify,
+            cancel,
             connection_version,
         };
         if self
@@ -2499,6 +2683,7 @@ where
                     .remove(&remote_peer_identity);
 
                 self.remote_peer_addr_watcher.forget(remote_peer_identity);
+                self.prepared.remove(&remote_peer_identity);
 
                 let is_being_evicted = self.being_evicted_peers.remove(&remote_peer_identity);
                 let Some(worker_tx) = self.tx_worker_handle_map.remove(&remote_peer_identity)
@@ -2607,6 +2792,7 @@ where
             Err(join_err) => {
                 let id = join_err.id();
                 if let Some(meta) = self.tx_worker_task_meta_map.remove(&id) {
+                    self.prepared.remove(&meta.remote_peer_identity);
                     tracing::error!(
                         "Join error during tx sender worker {}: {:?}",
                         meta.remote_peer_identity,
@@ -2624,18 +2810,22 @@ where
     ///
     /// Schedules a graceful drop of all transaction workers.
     ///
-    /// The scheduled task waits for all transaction workers to complete and drop their senders.
-    /// All transaction workers are detached from the driver runtime and not managed anymore.
+    /// The driver's tasklet set owns cancellation and joining of these workers.
     ///
     ///
-    fn schedule_graceful_drop_all_worker(&mut self) {
+    fn schedule_graceful_drop_all_worker(&mut self, drop_reason: TxDropReason) {
+        self.prepared.clear();
         tracing::trace!("Scheduling graceful drop of all transaction workers");
         let mut tx_worker_meta = std::mem::take(&mut self.tx_worker_task_meta_map);
         // Make sure to update the endpoint usage
         let tx_worker_sender_map = std::mem::take(&mut self.tx_worker_handle_map);
+        for handle in tx_worker_sender_map.values() {
+            handle.retire();
+        }
         let mut tx_worker_set = std::mem::take(&mut self.tx_worker_set);
         let mut tx_queues = std::mem::take(&mut self.tx_queues);
         self.active_staked_sorted_remote_peer.clear();
+        self.remote_peer_addr_watcher.peers.clear();
         let response_outlet = self.response_outlet.clone();
         let fut = async move {
             drop(tx_worker_sender_map);
@@ -2669,10 +2859,14 @@ where
                 let mut canceled_txn_queue =
                     tx_queues.remove(&remote_peer_identity).unwrap_or_default();
                 canceled_txn_queue.extend(inflight_txn);
-                if let Some(callback) = response_outlet.as_ref() {
+                canceled_txn_queue.retain_mut(|(tx, _)| !tx.reject_prepared());
+                if let Some(callback) = response_outlet
+                    .as_ref()
+                    .filter(|_| !canceled_txn_queue.is_empty())
+                {
                     let tx_drop = TxDrop {
                         remote_peer_identity,
-                        drop_reason: TxDropReason::DriverIdentityChanged,
+                        drop_reason: drop_reason.clone(),
                         dropped_tx_vec: canceled_txn_queue,
                     };
                     callback.call(TpuSenderResponse::TxDrop(tx_drop));
@@ -2682,6 +2876,20 @@ where
                     "graceful drop worker for remote peer: {}",
                     remote_peer_identity
                 );
+            }
+            // Connecting peers may have queued requests without a worker yet.
+            for (remote_peer_identity, mut dropped_tx_vec) in tx_queues {
+                dropped_tx_vec.retain_mut(|(tx, _)| !tx.reject_prepared());
+                if let Some(callback) = response_outlet
+                    .as_ref()
+                    .filter(|_| !dropped_tx_vec.is_empty())
+                {
+                    callback.call(TpuSenderResponse::TxDrop(TxDrop {
+                        remote_peer_identity,
+                        drop_reason: drop_reason.clone(),
+                        dropped_tx_vec,
+                    }));
+                }
             }
         };
 
@@ -2705,7 +2913,7 @@ where
     /// 1. Schedule a graceful drop of all transaction workers.
     /// 2. Clear the connection map.
     /// 3. Store inflight connecting task metadata, in order to replay them later.
-    /// 4. Abort and detach all inflight connecting tasks.
+    /// 4. Abort and join all inflight connecting tasks.
     /// 5. Clear all connecting remote peers and their addresses.
     /// 6. Clear the connecting blocked by eviction list.
     /// 7. Update the identity and client certificate.
@@ -2713,13 +2921,13 @@ where
     ///  
     ///
     async fn update_identity(&mut self, new_identity: Keypair, barrier_like: impl Future) {
-        self.schedule_graceful_drop_all_worker();
+        self.schedule_graceful_drop_all_worker(TxDropReason::DriverIdentityChanged);
         self.connection_map.clear();
         self.orphan_connection_set.clear();
         self.being_evicted_peers.clear();
         self.pending_connection_eviction_set.clear();
         self.connecting_tasks.abort_all();
-        self.connecting_tasks.detach_all();
+        while self.connecting_tasks.join_next().await.is_some() {}
         self.connecting_remote_peers.clear();
         self.connecting_remote_peers_addr.clear();
         self.connecting_blocked_by_eviction_list.clear();
@@ -2738,7 +2946,11 @@ where
         self.client_certificate = cert;
         self.identity = new_identity;
 
-        barrier_like.await;
+        tokio::select! {
+            biased;
+            _ = self.shutdown.cancelled() => return,
+            _ = barrier_like => {},
+        }
 
         connecting_meta.values().for_each(|meta| {
             meta.multiplexed_remote_peer_identity_vec
@@ -2834,7 +3046,7 @@ where
                                 new_addr
                             );
                             // Update the worker's remote address, and its peer too.
-                            handle.cancel_notify.notify_one();
+                            handle.retire();
                             // WE DON'T WANT TO EVICT THE CONNECTION OR OTHER MULTIPLEXED PEERS SHARING THE SAME CONNECTION.
                             // WE CAN'T ASSUME IF A REMOTE PEER ADDRESS CHANGED, THE OTHER MULTIPLEXED PEERS ADDRESSES ALSO CHANGED.
                             // WE SIMPLY CANCEL THE WORKER, AND WHEN THE WORKER RECONNECTS, IT WILL USE THE NEW ADDRESS.
@@ -2842,7 +3054,7 @@ where
                     }
                     None => {
                         // If we don't have a new address, we need to drop the worker.
-                        handle.cancel_notify.notify_one();
+                        handle.retire();
                         let connection_version = handle.connection_version;
                         let connection_eviction = ConnectionEviction {
                             remote_peer_addr: handle.remote_peer_addr,
@@ -2882,6 +3094,20 @@ where
                 if !visited.insert(upcoming_leader) {
                     // We have already processed this upcoming leader in this iteration.
                     continue;
+                }
+
+                // A prior publication may have lacked result/budget capacity.
+                // Retry during existing background warmup, never on admission.
+                if let Some(worker) = self.tx_worker_handle_map.get(&upcoming_leader)
+                    && !worker.cancel.is_cancelled()
+                {
+                    self.prepared.publish(
+                        upcoming_leader,
+                        worker.remote_peer_addr,
+                        worker.sender.clone(),
+                        worker.alive.clone(),
+                        self.config.transaction_sender_worker_channel_capacity,
+                    );
                 }
 
                 if !is_already_connectish {
@@ -2952,9 +3178,25 @@ where
     }
 
     pub async fn run(mut self) {
+        // Retain the owner across an operational panic. A completed driver
+        // handle must mean its children and endpoints have finished cleanup,
+        // so callers can safely start a replacement generation.
+        let outcome = AssertUnwindSafe(self.run_loop()).catch_unwind().await;
+        self.prepared.sender.close();
+        self.shutdown.cancel();
+        self.stop().await;
+        if let Err(panic) = outcome {
+            resume_unwind(panic);
+        }
+    }
+
+    async fn run_loop(&mut self) {
         let mut sleep_timer: Option<Pin<Box<Sleep>>> = None;
         let mut leader_prediction_timer: Option<Pin<Box<Sleep>>> = None;
         loop {
+            if self.shutdown.is_cancelled() {
+                break;
+            }
             self.do_eviction_if_required();
             self.try_predict_upcoming_leaders_if_necessary();
 
@@ -3008,6 +3250,7 @@ where
                     leader_prediction_timer = None;
                 }
                 // If cnc_rx returns None, we don't care as clients can safely drop cnc sender and the runtime should keep function.
+                _ = self.shutdown.cancelled() => break,
                 Some(command) = self.cnc_rx.recv() => {
                     self.handle_cnc(command).await;
                 }
@@ -3028,18 +3271,37 @@ where
                 }
             }
         }
+    }
 
-        self.schedule_graceful_drop_all_worker();
+    async fn stop(&mut self) {
+        self.tx_inlet.close();
+        while let Ok(tx) = self.tx_inlet.try_recv() {
+            self.tx_queues
+                .entry(tx.remote_peer)
+                .or_default()
+                .push_back((tx, 1));
+        }
+        self.connecting_tasks.abort_all();
+        while self.connecting_tasks.join_next().await.is_some() {}
+        self.schedule_graceful_drop_all_worker(TxDropReason::DriverShutdown);
+        for endpoint in &self.endpoints {
+            endpoint.close(VarInt::from_u32(0), b"driver shutdown");
+        }
         while let Some(result) = self.tasklet.join_next_with_id().await {
             self.handle_tasklet_result(result);
+        }
+        for endpoint in &self.endpoints {
+            endpoint.wait_idle().await;
         }
     }
 }
 
+// Polled only by the driver: no detached task, command queue or shared lock.
 struct RemotePeerAddrWatcher {
-    changes: Arc<StdMutex<HashSet<Pubkey>>>,
-    cnc_tx: mpsc::UnboundedSender<RemotePeerAddrWatcherCommand>,
-    notify: Arc<Notify>,
+    peers: HashMap<Pubkey, SocketAddr>,
+    leader_tpu_info_service: Arc<dyn LeaderTpuInfoService + Send + Sync + 'static>,
+    tpu_port_kind: TpuPortKind,
+    interval: tokio::time::Interval,
 }
 
 impl RemotePeerAddrWatcher {
@@ -3048,182 +3310,44 @@ impl RemotePeerAddrWatcher {
         tpu_port_kind: TpuPortKind,
         leader_tpu_info_service: Arc<dyn LeaderTpuInfoService + Send + Sync + 'static>,
     ) -> Self {
-        tracing::trace!(
-            "Spawning remote peer address watcher with refresh interval: {refresh_interval:?}"
-        );
-        let shared = Default::default();
-        let (cnc_tx, cnc_rx) = mpsc::unbounded_channel();
-        let notify = Arc::new(Notify::new());
-
-        // The event loop closes when the watcher is dropped.
-        let ev_loop = RemotePeerAddrWatcherEvLoop {
-            changes: Arc::clone(&shared),
+        let mut interval = interval(refresh_interval);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        Self {
+            peers: HashMap::new(),
             leader_tpu_info_service,
-            cnc_rx,
-            peers_to_watch_map: HashMap::new(),
             tpu_port_kind,
-            interval: refresh_interval,
-            notify: Arc::clone(&notify),
-        };
-
-        tokio::spawn(async move {
-            ev_loop.run().await;
-        });
-
-        RemotePeerAddrWatcher {
-            changes: shared,
-            cnc_tx,
-            notify,
+            interval,
         }
     }
 
-    ///
-    /// Registers a watch for a remote peer's address.
-    ///
-    /// If the remote peer's address changes, it will be notified through the `notified` method.
-    /// Note that remote peer address watches are only good for one address change. That means if the remote peer address changes again,
-    /// you need to register a new watch in order to be notified about the next change.
-    ///
-    fn register_watch(&self, remote_peer: Pubkey, addr: SocketAddr) {
-        if let Err(err) = self
-            .cnc_tx
-            .send(RemotePeerAddrWatcherCommand::RegisterWatch(
-                remote_peer,
-                addr,
-            ))
-        {
-            tracing::debug!(
-                "Remote peer address watcher command channel is closed while registering {remote_peer}: {err:?}"
-            );
-        }
+    fn register_watch(&mut self, peer: Pubkey, addr: SocketAddr) {
+        self.peers.entry(peer).or_insert(addr);
     }
 
-    ///
-    /// Deregisters a watch for a remote peer's address.
-    ///
-    fn forget(&self, remote_peer: Pubkey) {
-        if let Err(err) = self
-            .cnc_tx
-            .send(RemotePeerAddrWatcherCommand::DeregisterWatch(remote_peer))
-        {
-            tracing::debug!(
-                "Remote peer address watcher command channel is closed while deregistering {remote_peer}: {err:?}"
-            );
-        }
+    fn forget(&mut self, peer: Pubkey) {
+        self.peers.remove(&peer);
     }
 
-    ///
-    /// Waits for a remote peer address change notification.
-    /// Returns a set of remote peers whose addresses have changed since the last notification.
-    ///
-    /// Cancel-Sefety:
-    ///
-    /// This method is cancel-safe and won't lose notifications.
+    // Each watch ends after its first change. Interval::tick is cancel-safe;
+    // there is no yield between removing changed watches and returning them.
     async fn notified(&mut self) -> HashSet<Pubkey> {
-        self.notify.notified().await;
-        match self.changes.lock() {
-            Ok(mut guard) => std::mem::take(&mut *guard),
-            Err(err) => {
-                tracing::error!("Remote peer address watcher state is poisoned: {err:?}");
-                HashSet::new()
-            }
-        }
-    }
-}
-
-enum RemotePeerAddrWatcherCommand {
-    RegisterWatch(Pubkey, SocketAddr),
-    DeregisterWatch(Pubkey),
-}
-
-struct RemotePeerAddrWatcherEvLoop {
-    changes: Arc<StdMutex<HashSet<Pubkey>>>,
-    leader_tpu_info_service: Arc<dyn LeaderTpuInfoService + Send + Sync + 'static>,
-    cnc_rx: mpsc::UnboundedReceiver<RemotePeerAddrWatcherCommand>,
-    peers_to_watch_map: HashMap<Pubkey, SocketAddr>,
-    tpu_port_kind: TpuPortKind,
-    interval: Duration,
-    notify: Arc<Notify>,
-}
-
-impl RemotePeerAddrWatcherEvLoop {
-    fn handle_cnc(&mut self, command: RemotePeerAddrWatcherCommand) {
-        match command {
-            RemotePeerAddrWatcherCommand::RegisterWatch(pubkey, initial_addr) => {
-                self.peers_to_watch_map
-                    .entry(pubkey)
-                    .or_insert(initial_addr);
-            }
-            RemotePeerAddrWatcherCommand::DeregisterWatch(pubkey) => {
-                self.peers_to_watch_map.remove(&pubkey);
-            }
-        }
-    }
-
-    fn update_peers_to_watch(&mut self) {
-        let diff = self
-            .peers_to_watch_map
-            .iter()
-            .filter_map(|(pubkey, last_known_addr)| {
-                let new_addr = self
-                    .leader_tpu_info_service
-                    .get_quic_dest_addr(pubkey, self.tpu_port_kind);
-                match new_addr {
-                    Some(new_addr) => {
-                        if new_addr != *last_known_addr {
-                            Some(*pubkey)
-                        } else {
-                            None
-                        }
-                    }
-                    None => Some(*pubkey),
-                }
-            })
-            .collect::<Vec<_>>();
-        if diff.is_empty() {
-            return;
-        }
-        {
-            let Ok(mut guard) = self.changes.lock() else {
-                tracing::error!("Remote peer address watcher state is poisoned");
-                return;
-            };
-            for pubkey in diff {
-                let Some(old) = self.peers_to_watch_map.remove(&pubkey) else {
-                    tracing::debug!(
-                        "Remote peer {pubkey} disappeared from address watcher before update"
-                    );
-                    continue;
-                };
-                tracing::trace!(
-                    "Remote peer address changed: {}, used to be advertised on {:?}",
-                    pubkey,
-                    old,
-                );
-                guard.insert(pubkey);
-            }
-            self.notify.notify_one();
-        }
-    }
-
-    async fn run(mut self) {
-        let mut interval = interval(self.interval);
         loop {
-            tokio::select! {
-                _  = interval.tick() => {
-                    self.update_peers_to_watch();
-                },
-                maybe = self.cnc_rx.recv() => {
-                    match maybe {
-                        Some(command) => {
-                            self.handle_cnc(command);
-                        }
-                        None => {
-                            tracing::debug!("Remote peer address watcher inlet closed");
-                            break;
-                        }
-                    }
+            self.interval.tick().await;
+            let mut changes = HashSet::new();
+            self.peers.retain(|peer, previous| {
+                if self
+                    .leader_tpu_info_service
+                    .get_quic_dest_addr(peer, self.tpu_port_kind)
+                    == Some(*previous)
+                {
+                    true
+                } else {
+                    changes.insert(*peer);
+                    false
                 }
+            });
+            if !changes.is_empty() {
+                return changes;
             }
         }
     }
@@ -3233,6 +3357,8 @@ impl RemotePeerAddrWatcherEvLoop {
 /// Context struct holding handles to interact with a spawned TPU sender driver.
 ///
 pub struct TpuSenderSessionContext {
+    shutdown: CancellationToken,
+    prepared: PreparedSender,
     ///
     /// The [`TpuSenderIdentityUpdater`] use to change the driver configured [`Keypair`].
     ///
@@ -3249,6 +3375,20 @@ pub struct TpuSenderSessionContext {
     /// Dropping this handle does not interrupt the driver runtime.
     ///
     pub driver_join_handle: JoinHandle<()>,
+}
+
+impl TpuSenderSessionContext {
+    pub fn prepared_sender(&self) -> PreparedSender {
+        self.prepared.clone()
+    }
+    /// Revoke the session even if senders remain, then join its owned work.
+    /// This also ends identity synchronization. The caller must shut down other
+    /// participants of an unfinished shared identity barrier rather than await it.
+    pub async fn shutdown(self) -> Result<(), JoinError> {
+        self.prepared.close();
+        self.shutdown.cancel();
+        self.driver_join_handle.await
+    }
 }
 
 ///
@@ -3418,7 +3558,12 @@ impl TpuSenderDriverSpawner {
             config.tpu_port,
             Arc::clone(&self.leader_tpu_info_service),
         );
+        let shutdown = CancellationToken::new();
+        let prepared = PreparedPeers::new(config.prepared_peer_capacity);
+        let prepared_sender = prepared.sender.clone();
         let driver = TpuSenderDriver {
+            shutdown: shutdown.clone(),
+            prepared,
             stake_info_map: Arc::clone(&self.stake_info_map),
             tx_worker_handle_map: Default::default(),
             tx_worker_task_meta_map: Default::default(),
@@ -3457,6 +3602,8 @@ impl TpuSenderDriverSpawner {
         let jh = driver_rt.spawn(driver.run());
 
         TpuSenderSessionContext {
+            shutdown,
+            prepared: prepared_sender,
             driver_tx_sink: tx_inlet,
             identity_updater: TpuSenderIdentityUpdater::new(driver_cnc_tx),
             driver_join_handle: jh,
@@ -3592,6 +3739,10 @@ pub enum UpdateIdentityError {
 pub const fn module_path_for_test() -> &'static str {
     module_path!()
 }
+
+#[cfg(test)]
+#[path = "core/lifecycle_tests.rs"]
+mod lifecycle_tests;
 
 #[cfg(test)]
 mod test {
@@ -3786,7 +3937,9 @@ mod test {
         assert!(dropped.dropped_tx_vec.is_empty());
 
         drop(session.driver_tx_sink);
-        timeout(Duration::from_secs(1), session.driver_join_handle)
+        // No handshake completed: Quinn drains for three initial PTOs (~3 s),
+        // independently of the configured 60 s connection-attempt timeout.
+        timeout(Duration::from_secs(5), session.driver_join_handle)
             .await
             .expect("driver exits")
             .expect("driver task");

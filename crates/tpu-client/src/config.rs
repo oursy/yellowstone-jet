@@ -107,6 +107,11 @@ pub struct TpuSenderConfig {
     ///
     #[serde(default = "TpuSenderConfig::default_transaction_sender_worker_channel_capacity")]
     pub transaction_sender_worker_channel_capacity: usize,
+    /// Maximum published prepared peers. Zero disables prepared admission.
+    /// Each peer separately bounds active work and unread results by the worker
+    /// channel capacity. Physical connections may multiplex several peer keys.
+    #[serde(default)]
+    pub prepared_peer_capacity: usize,
 
     ///
     /// Timeout for establishing a connection to a remote peer.
@@ -175,6 +180,8 @@ pub struct TpuSenderConfig {
 
     ///
     /// Timeout for sending a transaction to a remote peer.
+    /// Covers stream credit and writing together. Expiry terminates the request
+    /// without retry; successful local buffering does not wait for a peer ACK.
     ///
     #[serde(
         default = "TpuSenderConfig::default_send_timeout",
@@ -350,6 +357,7 @@ impl Default for TpuSenderConfig {
             max_idle_timeout: QUIC_MAX_TIMEOUT,
             max_connection_attempts: DEFAULT_MAX_CONSECUTIVE_CONNECTION_ATTEMPT,
             transaction_sender_worker_channel_capacity: DEFAULT_PER_PEER_TRANSACTION_QUEUE_SIZE,
+            prepared_peer_capacity: 0,
             connecting_timeout: DEFAULT_CONNECTION_TIMEOUT,
             max_concurrent_connection: DEFAULT_MAX_CONCURRENT_CONNECTIONS,
             max_local_port_binding_attempts: DEFAULT_MAX_LOCAL_BINDING_PORT_ATTEMPTS,

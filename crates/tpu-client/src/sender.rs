@@ -99,6 +99,7 @@ where
         identity_updater: _,
         driver_tx_sink,
         driver_join_handle: _,
+        ..
     } = session;
 
     TpuSender {
