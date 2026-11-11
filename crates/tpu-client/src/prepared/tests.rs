@@ -125,6 +125,7 @@ async fn worker_panic_preserves_exposure_and_releases_execution_capacity() {
             )
         };
         let outcome = submit().unwrap();
+        let admitted_at = Instant::now();
         let mut tx = receiver.recv().await.unwrap();
         let task = tokio::spawn(async move {
             if exposed {
@@ -144,7 +145,12 @@ async fn worker_panic_preserves_exposure_and_releases_execution_capacity() {
                 reason: PreparedFailure::WorkerStopped,
             }
         };
-        assert_eq!(outcome.await.status, expected);
+        let outcome = outcome.await;
+        assert_eq!(outcome.status, expected);
+        assert_eq!(outcome.invoked_at.is_some(), exposed);
+        if let Some(invoked_at) = outcome.invoked_at {
+            assert!(invoked_at >= admitted_at && invoked_at <= outcome.completed_at);
+        }
         let next = submit().expect("capacity must be released before exposing the result");
         drop(receiver.recv().await.unwrap());
         let _ = next.await;

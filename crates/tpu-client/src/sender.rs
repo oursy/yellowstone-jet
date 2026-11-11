@@ -95,12 +95,7 @@ where
         callback,
     );
 
-    let TpuSenderSessionContext {
-        identity_updater: _,
-        driver_tx_sink,
-        driver_join_handle: _,
-        ..
-    } = session;
+    let TpuSenderSessionContext { driver_tx_sink, .. } = session;
 
     TpuSender {
         txn_tx: driver_tx_sink,

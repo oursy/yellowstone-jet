@@ -24,6 +24,17 @@ It implements the state-of-the-art approach to send transaction, that includes:
 - Connection prediction so upcoming leaders can be warmed before the next send.
 - Bounded per-leader queues to avoid unbounded memory growth under TPU backpressure.
 
+## Prepared send timing
+
+The `driver` feature's `PreparedOutcome.invoked_at` retains the original worker's
+monotonic timestamp immediately before its first QUIC payload write is polled.
+It excludes admission and stream-credit waits and survives a later timeout,
+cancellation, or worker unwind. No payload invocation, or a lost worker result,
+leaves the timestamp absent; `completed_at` is never substituted for it.
+This is local API timing, not socket-first-write or remote/chain confirmation.
+The same timestamp presence preserves the existing exposed/not-sent distinction;
+no additional task, retry, callback, or result channel is introduced.
+
 ## Usage
 
 ```rust

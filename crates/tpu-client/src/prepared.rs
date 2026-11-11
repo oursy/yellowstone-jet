@@ -69,6 +69,10 @@ pub enum PreparedStatus {
 #[derive(Clone, Copy, Debug)]
 pub struct PreparedOutcome {
     pub status: PreparedStatus,
+    /// Original worker time immediately before polling the first payload write.
+    /// Excludes queue/stream-credit waits; not proof of a socket write or receipt.
+    /// None when no invocation was recorded, including a lost worker result.
+    pub invoked_at: Option<Instant>,
     pub completed_at: Instant,
 }
 
@@ -115,6 +119,7 @@ impl Future for PreparedSubmission {
             status: PreparedStatus::Unknown {
                 reason: PreparedFailure::WorkerStopped,
             },
+            invoked_at: None,
             completed_at: Instant::now(),
         }))
     }
@@ -246,7 +251,7 @@ impl PreparedSender {
         tx.completion = Some(Completion {
             outcome: Some(outcome),
             work: Some(work),
-            exposed: false,
+            invoked_at: None,
         });
         slot.send(tx);
         Ok(PreparedSubmission {
@@ -364,11 +369,11 @@ impl Drop for PreparedPeers {
 pub(crate) struct Completion {
     outcome: Option<oneshot::Sender<PreparedOutcome>>,
     work: Option<OwnedSemaphorePermit>,
-    exposed: bool,
+    invoked_at: Option<Instant>,
 }
 impl Completion {
     pub(crate) fn mark_exposed(&mut self) {
-        self.exposed = true;
+        self.invoked_at.get_or_insert_with(Instant::now);
     }
     pub(crate) fn finish(mut self, status: PreparedStatus) {
         self.publish(status);
@@ -377,7 +382,7 @@ impl Completion {
         self.publish(self.failure_status(reason));
     }
     fn failure_status(&self, reason: PreparedFailure) -> PreparedStatus {
-        if self.exposed {
+        if self.invoked_at.is_some() {
             PreparedStatus::Unknown { reason }
         } else {
             PreparedStatus::NotSent { reason }
@@ -388,6 +393,7 @@ impl Completion {
         if let Some(outcome) = self.outcome.take() {
             let _ = outcome.send(PreparedOutcome {
                 status,
+                invoked_at: self.invoked_at,
                 completed_at: Instant::now(),
             });
         }

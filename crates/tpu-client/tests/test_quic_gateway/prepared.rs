@@ -298,12 +298,14 @@ async fn prepared_credit_deadline_is_not_sent_and_never_replayed() {
             Instant::now() + Duration::from_millis(50),
         )
         .unwrap();
+    let outcome = timeout(WAIT, pending).await.unwrap();
     assert_eq!(
-        timeout(WAIT, pending).await.unwrap().status,
+        outcome.status,
         PreparedStatus::NotSent {
             reason: PreparedFailure::Deadline
         }
     );
+    assert!(outcome.invoked_at.is_none());
     connection.set_max_concurrent_uni_streams(VarInt::from_u32(1));
     assert!(
         timeout(Duration::from_millis(100), connection.accept_uni())
@@ -334,11 +336,17 @@ async fn prepared_partial_write_timeout_is_unknown_and_not_retried() {
         .await
         .unwrap()
         .unwrap();
+    let outcome = timeout(WAIT, pending).await.unwrap();
     assert_eq!(
-        timeout(WAIT, pending).await.unwrap().status,
+        outcome.status,
         PreparedStatus::Unknown {
             reason: PreparedFailure::Deadline
         }
+    );
+    assert!(
+        outcome
+            .invoked_at
+            .is_some_and(|at| at <= outcome.completed_at)
     );
     assert!(matches!(
         timeout(WAIT, stream.read_to_end(4_096)).await.unwrap(),
@@ -349,6 +357,55 @@ async fn prepared_partial_write_timeout_is_unknown_and_not_retried() {
             .await
             .is_err()
     );
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn prepared_invocation_time_excludes_waiting_for_stream_credit() {
+    let mut transport = quinn::TransportConfig::default();
+    transport.max_concurrent_uni_streams(VarInt::from_u32(0));
+    let fixture = Fixture::start(transport, true);
+    let connection = fixture.warm().await;
+    let (tx, wire) = signed_v1_wire(1_233);
+    let mut pending = fixture
+        .sender
+        .try_send(
+            tx.signatures[0],
+            fixture.selection(),
+            Bytes::from(wire.clone()),
+            Instant::now() + WAIT,
+        )
+        .unwrap();
+    assert!(
+        timeout(Duration::from_millis(50), &mut pending)
+            .await
+            .is_err()
+    );
+    let released_at = Instant::now();
+    connection.set_max_concurrent_uni_streams(VarInt::from_u32(1));
+    let received = timeout(WAIT, async {
+        connection
+            .accept_uni()
+            .await
+            .unwrap()
+            .read_to_end(1_233)
+            .await
+            .unwrap()
+    })
+    .await
+    .unwrap();
+    let received_at = Instant::now();
+    assert_eq!(received, wire);
+    let outcome = timeout(WAIT, pending).await.unwrap();
+    assert_eq!(outcome.status, PreparedStatus::LocallyWritten);
+    let invoked_at = outcome
+        .invoked_at
+        .expect("original payload invocation time");
+    assert!(
+        invoked_at >= released_at,
+        "queue/stream admission is not a send"
+    );
+    assert!(invoked_at <= received_at && invoked_at <= outcome.completed_at);
     fixture.shutdown().await;
 }
 
@@ -431,6 +488,10 @@ async fn unread_results_keep_their_capacity_across_connection_generations() {
 }
 
 #[tokio::test]
+#[expect(
+    clippy::async_yields_async,
+    reason = "Wait only for admission; awaiting the returned write before granting stream credit would deadlock this test."
+)]
 async fn dropped_receiver_does_not_free_running_work() {
     let mut transport = quinn::TransportConfig::default();
     transport.max_concurrent_uni_streams(VarInt::from_u32(0));
